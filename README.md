@@ -179,6 +179,32 @@ and libffi headers:
 sudo apt-get install -y pkg-config libffi-dev
 ```
 
+### Apple silicon: float32 MLX
+
+The optional `--mlx32` backend runs the fixed FlyWire v783 LIF model on the
+Apple GPU through Metal. Install its dependencies separately from the CUDA
+backends:
+
+```bash
+uv venv --python 3.10 .venv
+uv pip install --python .venv/bin/python -r requirements-mlx32.txt
+.venv/bin/python main.py --mlx32 --experiment sugar --t_run 1 --n_run 4
+.venv/bin/python main.py --mlx32 --experiment p9 --t_run 1 --n_run 1
+```
+
+Trials share the graph and execute as an independent GPU batch. Inputs are
+reproducible for a fixed seed, trial and round; they do not reproduce Brian's
+random-number stream. The adapter uses native float32 state, the model's linear
+update and integer contact counts. Fractional contact data is rejected. This
+backend is specific to this model and does not implement a general Brian device.
+
+The existing recording switch, run labels and result columns also apply.
+Recording streams bounded ordered batches to parquet; `--disable-spike-io`
+omits the spike file. Warm execution, input staging, collection and setup costs
+are reported separately. MLX requires an available Metal GPU and has no CPU
+fallback. The runtime adapts selected MIT-licensed Kisame76 code; attribution and
+its full notice are in `code/mlx32/`.
+
 ### GeNN
 
 The `--genn` backend uses PyGeNN 5.4.0 with the CUDA backend. It implements

@@ -408,6 +408,7 @@ BACKEND_NAMES = {
     'nestgpu': 'NEST GPU',
     'genn': 'GeNN (GPU)',
     'brian2genn': 'Brian2GeNN (GPU)',
+    'mlx32': 'MLX float32 (Apple GPU)',
 }
 
 
@@ -419,7 +420,7 @@ def run_benchmarks(backends, t_run_values=None, n_run_values=None,
 
     Args:
         backends: list of backend keys
-            ('cpu', 'gpu', 'pytorch', 'nestgpu', 'genn', 'brian2genn')
+            ('cpu', 'gpu', 'pytorch', 'nestgpu', 'genn', 'brian2genn', 'mlx32')
         t_run_values: list of t_run durations in seconds, or None for all
         n_run_values: list of n_run values, or None for N_RUN_VALUES
         experiment: experiment config dict from get_experiment()
@@ -509,6 +510,18 @@ def run_benchmarks(backends, t_run_values=None, n_run_values=None,
             elif backend == 'genn':
                 from run_genn import run_all_benchmarks as run_genn
                 results = run_genn(
+                    t_run_values=t_run_values,
+                    n_run_values=n_run_values,
+                    experiment=experiment,
+                    logger=logger,
+                    run_label=run_label,
+                    round_idx=round_label,
+                )
+                all_results.setdefault(backend, []).extend(results)
+
+            elif backend == 'mlx32':
+                from run_mlx32 import run_all_benchmarks as run_mlx32
+                results = run_mlx32(
                     t_run_values=t_run_values,
                     n_run_values=n_run_values,
                     experiment=experiment,

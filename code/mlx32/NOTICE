@@ -1,0 +1,15 @@
+The float32 kernels, sparse contact accumulation, chunk scheduling and event
+recording adapt portions of Kiyan Doguc's MIT-licensed implementation:
+https://github.com/Kisame76/drosophila-brain-mlx
+Revision: e417b33616513ef350b1b1c3cdf2b5b7a1799c8e.
+The full original notice is in Kisame76-LICENSE.
+
+Local adaptations use Eon's v783 graph contract and SI units, preserve ordered
+duplicate stimulation channels, and expose bounded recording and independent
+qualification observations. Eon's repository licensing declarations remain
+unchanged, subject to applicable third-party notices.
+
+The scientific model and parameters originate with Shiu et al.'s leaky
+integrate-and-fire Drosophila model. The donor credits Brian2's generated
+linear-update coefficients and mehrantsi/flyBrain's sparse/fused-kernel ideas.
+This directory contributes an execution implementation, not new model or data.

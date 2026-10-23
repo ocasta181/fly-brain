@@ -18,6 +18,7 @@ Usage:
     python main.py --nestgpu                             # NEST GPU only
     python main.py --genn                                # GeNN only
     python main.py --brian2genn                          # Brian2GeNN GPU only
+    python main.py --mlx32                               # Apple GPU, float32
     python main.py --brian2-cpu --pytorch --nestgpu      # Brian2 CPU + PyTorch + NEST GPU
 
     # Brian2GeNN uses a separate environment because it pins Brian2<2.6
@@ -99,6 +100,9 @@ def main():
     parser.add_argument('--brian2genn', action='store_true',
                         help='Run Brian2GeNN benchmark')
 
+    parser.add_argument('--mlx32', action='store_true',
+                        help='Run native float32 MLX on an Apple GPU')
+
     args = parser.parse_args()
 
     if args.disable_spike_io:
@@ -109,7 +113,7 @@ def main():
     # separate Brian2<2.6 environment that conflicts with Brian2CUDA.
     if not (
         args.brian2_cpu or args.brian2cuda_gpu
-        or args.pytorch or args.nestgpu or args.genn or args.brian2genn
+        or args.pytorch or args.nestgpu or args.genn or args.brian2genn or args.mlx32
     ):
         backends = ['cpu', 'gpu', 'pytorch', 'nestgpu', 'genn']
     else:
@@ -126,6 +130,8 @@ def main():
             backends.append('genn')
         if args.brian2genn:
             backends.append('brian2genn')
+        if args.mlx32:
+            backends.append('mlx32')
 
     # Import brian2cuda once to register the cuda_standalone device
     if 'gpu' in backends:
