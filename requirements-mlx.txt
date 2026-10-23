@@ -1,0 +1,9 @@
+# Native macOS Apple silicon; Python 3.10.14.
+mlx==0.32.3; sys_platform == "darwin" and platform_machine == "arm64"
+mlx-metal==0.32.3; sys_platform == "darwin" and platform_machine == "arm64"
+numpy==1.26.4
+pyarrow==25.0.1
+pandas==2.3.3
+# Equation parsing/linear-state analysis; simulation timesteps execute on Metal.
+brian2==2.8.0
+joblib==1.4.2

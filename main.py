@@ -49,6 +49,17 @@ from benchmark import (
 )
 
 
+BACKEND_OPTIONS = (
+    ('brian2-cpu', 'cpu', 'Run Brian2 C++ standalone (CPU)'),
+    ('brian2cuda-gpu', 'gpu', 'Run Brian2CUDA (GPU)'),
+    ('pytorch', 'pytorch', 'Run PyTorch benchmark'),
+    ('nestgpu', 'nestgpu', 'Run NEST GPU benchmark'),
+    ('genn', 'genn', 'Run GeNN benchmark'),
+    ('brian2genn', 'brian2genn', 'Run Brian2GeNN benchmark'),
+    ('mlx', 'mlx', 'Run Apple MLX with independent batched trials'),
+)
+
+
 def main():
     parser = argparse.ArgumentParser(description='Drosophila brain model benchmark')
     parser.add_argument('--t_run', type=float, nargs='+', default=None,
@@ -86,18 +97,8 @@ def main():
                              f'Available: {list(EXPERIMENTS.keys())}. '
                              'Default: sugar')
 
-    parser.add_argument('--brian2-cpu', action='store_true',
-                        help='Run Brian2 C++ standalone (CPU)')
-    parser.add_argument('--brian2cuda-gpu', action='store_true',
-                        help='Run Brian2CUDA (GPU)')
-    parser.add_argument('--pytorch', action='store_true',
-                        help='Run PyTorch benchmark')
-    parser.add_argument('--nestgpu', action='store_true',
-                        help='Run NEST GPU benchmark')
-    parser.add_argument('--genn', action='store_true',
-                        help='Run GeNN benchmark')
-    parser.add_argument('--brian2genn', action='store_true',
-                        help='Run Brian2GeNN benchmark')
+    for flag, _, help_text in BACKEND_OPTIONS:
+        parser.add_argument('--' + flag, action='store_true', help=help_text)
 
     args = parser.parse_args()
 
@@ -107,25 +108,10 @@ def main():
     # If no backend flags specified, run the backends available in the main
     # brain-fly environment. Brian2GeNN is explicit because it requires a
     # separate Brian2<2.6 environment that conflicts with Brian2CUDA.
-    if not (
-        args.brian2_cpu or args.brian2cuda_gpu
-        or args.pytorch or args.nestgpu or args.genn or args.brian2genn
-    ):
+    backends = [key for flag, key, _ in BACKEND_OPTIONS
+                if getattr(args, flag.replace('-', '_'))]
+    if not backends:
         backends = ['cpu', 'gpu', 'pytorch', 'nestgpu', 'genn']
-    else:
-        backends = []
-        if args.brian2_cpu:
-            backends.append('cpu')
-        if args.brian2cuda_gpu:
-            backends.append('gpu')
-        if args.pytorch:
-            backends.append('pytorch')
-        if args.nestgpu:
-            backends.append('nestgpu')
-        if args.genn:
-            backends.append('genn')
-        if args.brian2genn:
-            backends.append('brian2genn')
 
     # Import brian2cuda once to register the cuda_standalone device
     if 'gpu' in backends:

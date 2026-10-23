@@ -412,6 +412,64 @@ Legacy version 630 data is kept in `data/archive/` for paper figure reproduction
 - NEST GPU compiled from source (for `--nestgpu` backend)
 - `scripts/setup_WSL_CUDA.sh` documents the full setup from a fresh Windows machine
 
+## Apple MLX backend
+
+The opt-in MLX backend runs Eon simulations on native Apple Metal while
+preserving the existing CPU default. The qualification below describes actual
+measured workloads and named boundary checks; it does not establish every input
+combination accepted by the original model.
+
+On Apple silicon macOS, use Python 3.10.14 and the optional MLX environment:
+
+```sh
+uv venv --python 3.10.14
+uv pip install -r requirements-mlx.txt
+uv run --no-project python main.py --mlx --t_run 0.1 --n_run 1 --run-label mlx_first --no_log_file
+```
+
+`--mlx` selects native Metal simulation. Existing backends and defaults remain
+unchanged. Use a fresh run label. CLI trials use reproducible PCG64 inputs and
+independent state; repeated rounds receive distinct streams. The backend writes
+CSV results, round manifests, Parquet spikes and `.mlx.json` timing metadata.
+Use `--disable-spike-io` to run without spike collection or export.
+
+Default CLI execution uses the configured native Metal engine with binary64
+physical state and the selected Brian CPU arithmetic policy. The historical
+`window` engine selector remains accepted for compatibility; it selects this
+same exact route. Sidecar `engine` records the requested selector.
+
+Native paths implement custom activation and silencing, duplicate input targets,
+alternate datasets, fractional weights and configurable model expressions.
+Long runs generate inputs in bounded chunks and spool recorded spikes to disk.
+The [original Brian API adapter](docs/mlx-original-api.md) retains Brian objects,
+channel order, RNG state and continuation through an opt-in context manager.
+The source includes Brian built-in equation functions, native paired complex
+temporaries, and real, integer or Boolean persistent state. Native floating
+status drives NumPy error and warning actions; action delivery alone runs on
+the host. Generic user Python callbacks remain outside Eon's contract.
+
+### Qualification scope
+
+The [maintainer review note](docs/mlx-review.md) records measured sources,
+comparison methods, named boundary checks and the clean-checkout command.
+
+| Evidence | Observed result and scope |
+|---|---|
+| Matched performance | All 16 representative cases meet the 2× median floor: 2.029962–7.279297× versus Brian Cython runtime workers. One exceeds the 5× target; 15 meet the accepted 2–5× band. These desktop-qualified results are separate from C++ CLI timing. |
+| Native workflows | 28 observations, 27 recorded cells and 54 exports include standard/default/paper/resumed execution and largest 1000s/32-trial recording on/off equality. Two default and 76 paper cross-product cells remain unrun. |
+| Independent-input P9 | Passes at 9216 trials per arm with fixed margins and Brian controls. The scientific runtime remains `5feffb5dcd32`; later applicability comes from scoped source review. |
+| Boundary regressions | Named exact CPU/Metal checks cover complex/cast/NumPy-action behavior, recording, arithmetic, IEEE parameters/delays, empty and signed clocks, optional reset, failure prefixes and continuation. Coverage and comparison rules are detailed in the review note. |
+
+Campaign receipts, failed witnesses, output datasets and execution archives stay
+in the separate private evidence pack.
+
+Install `requirements-mlx-test.txt` for CPU-reference and regression checks.
+`python -m pytest -m 'not metal'` selects host checks;
+`python -m pytest -m metal` requires Apple silicon and a working Metal device.
+The [replay fixtures](tests/data/mlx-replay/README.md) contain independent Brian2
+inputs and expected spikes. Shared-input replay and the independent-input P9
+study answer different correctness questions.
+
 ## License
 
 Except where otherwise noted, this project is licensed under the GNU General

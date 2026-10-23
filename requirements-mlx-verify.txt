@@ -1,0 +1,21 @@
+# Portable Apple silicon verification, Python 3.10.14.
+# Runtime/test pins plus their qualified transitive dependency versions.
+-r requirements-mlx-test.txt
+Cython==3.3.0
+exceptiongroup==1.3.1; python_version < "3.11"
+iniconfig==2.3.1
+Jinja2==3.1.6
+MarkupSafe==3.0.4
+mpmath==1.3.0
+packaging==26.3
+pluggy==1.7.0
+Pygments==2.21.0
+pyparsing==3.3.3
+python-dateutil==2.9.0.post0
+pytz==2026.5
+setuptools==84.0.0
+six==1.17.0
+sympy==1.14.0
+tomli==2.5.0; python_version < "3.11"
+typing-extensions==4.16.0; python_version < "3.13"
+tzdata==2026.5

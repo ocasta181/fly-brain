@@ -1,0 +1,23 @@
+ArrowMetal-derived exact binary64 multiplication specialization
+Copyright 2026 ArrowMetal contributors
+Licensed under the Apache License, Version 2.0; see ArrowMetal-LICENSE.
+
+Upstream repository: https://github.com/singhpratech/ArrowMetal
+Pinned commit: 1f2111540e68edfdf1adf87df8821ca9cd1958c0
+Source file: DoubleMath.swift (the static let msl multiline string)
+Exact upstream extraction and hashes are recorded in ArrowMetal-NOTICE.
+
+Local modification, 2026-10-18:
+hyperbolic_math64.py defines a separate private hyper_mul helper using the
+existing d_mul 53-by-53 significand product and d_finish round-to-even rules.
+Normal operands produce a retained significand with its leading bit at55or56;
+the helper uses one bit test and a sticky right shift instead of general
+leading-zero normalization. Exceptional operands delegate to the unchanged
+d_mul. Subnormal and overflowing product exponents use unchanged d_finish.
+The upstream _ARROWMETAL_HEADER remains byte-for-byte unchanged.
+
+inverse_trigonometry64.py reuses this specialization under the private
+_eon_asincos64_mul name and EON_INVERSE_MUL_INCLUDED guard. The same normal
+operand check, full product, rounding and exceptional delegation apply.
+
+This is a local provenance/modification notice, not an upstream NOTICE file.

@@ -1,0 +1,14 @@
+The stable_div helper and stable_fma final round/pack rules in
+code/mlx_backend/stable_math64.py derive from ArrowMetal's DoubleMath.swift
+at commit 1f2111540e68edfdf1adf87df8821ca9cd1958c0.
+
+Copyright 2026 ArrowMetal contributors.
+Licensed under the Apache License, Version 2.0; see ArrowMetal-LICENSE.
+Pinned upstream provenance is also recorded in ArrowMetal-NOTICE.
+
+Local modifications: rename the division helper; use two Newton refinement
+iterations under explicitly required safe Metal math. The FMA finish path
+omits a normalization already established by its caller; range cases retain
+d_finish. Exact remainder correction, special-case handling and final
+binary64 rounding remain in the algorithms. Global binary64 helpers are
+unchanged.

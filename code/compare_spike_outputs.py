@@ -33,6 +33,7 @@ FRAMEWORKS = {
     'nestgpu': 'NEST GPU',
     'genn': 'GeNN (GPU)',
     'brian2genn': 'Brian2GeNN (GPU)',
+    'mlx': 'MLX (Apple GPU)',
 }
 
 DEFAULT_T_RUN = [0.1, 1.0, 10.0, 100.0]
@@ -58,28 +59,25 @@ def load_spikes(backend_key, t_run, n_run, run_label=None, round_idx=None):
     else:
         time_column = 't'
 
-    columns = ['trial', 'flywire_id', 'neuron_index', time_column]
+    columns = ['trial', 'flywire_id', time_column]
+    if 'neuron_index' in schema_columns:
+        columns.append('neuron_index')
     df = pd.read_parquet(path, columns=columns)
-    if len(df) == 0:
-        df = pd.DataFrame(
-            columns=['trial', 'flywire_id', 'neuron_index', 'time_s'],
-        )
-        return df, path
-
     if time_column == 'time_ms':
         time_s = df['time_ms'].to_numpy(dtype=np.float64) / 1000.0
     elif time_column == 'time_s':
         time_s = df['time_s'].to_numpy(dtype=np.float64)
     else:
         time_values = df['t'].to_numpy(dtype=np.float64)
-        time_s = time_values / 1000.0 if np.nanmax(time_values) > t_run * 2 else time_values
+        time_s = time_values / 1000.0 if backend_key == 'pytorch' else time_values
 
     out = pd.DataFrame({
-        'trial': df['trial'].to_numpy(dtype=np.int16, copy=False),
+        'trial': df['trial'].to_numpy(dtype=np.int64, copy=False),
         'flywire_id': df['flywire_id'].to_numpy(copy=False),
-        'neuron_index': df['neuron_index'].to_numpy(copy=False),
         'time_s': time_s,
     })
+    if 'neuron_index' in df.columns:
+        out['neuron_index'] = df['neuron_index'].to_numpy(copy=False)
     return out, path
 
 

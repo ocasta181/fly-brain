@@ -36,6 +36,7 @@ BACKENDS = {
     'nestgpu':    'NEST GPU',
     'genn':       'GeNN (GPU)',
     'brian2genn': 'Brian2GeNN (GPU)',
+    'mlx':   'MLX (Apple GPU)',
 }
 
 GROUND_TRUTH_KEY = 'brian2cpp'
@@ -106,7 +107,7 @@ def compare(gt_df, other_df, t_run, n_run):
         for i in deviation_idx:
             nid = shared_list[i]
             top_deviations.append({
-                'flywire_id': int(nid),
+                'flywire_id': nid.item() if isinstance(nid, np.generic) else nid,
                 'gt_rate_hz': round(float(gt_vec[i]), 2),
                 'other_rate_hz': round(float(other_vec[i]), 2),
                 'pct_diff': round(float(pct_diffs[i]), 1),

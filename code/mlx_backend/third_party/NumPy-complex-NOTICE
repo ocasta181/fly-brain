@@ -1,0 +1,21 @@
+The complex-array absolute-value arithmetic in complex_math64.py adapts the
+NumPy 1.26.4 ASIMD ufunc operation order from:
+https://github.com/numpy/numpy/blob/v1.26.4/numpy/core/src/umath/loops_unary_complex.dispatch.c.src
+Copyright (c) NumPy Developers. The NumPy license is retained in NumPy-LICENSE.
+
+The separate array complex multiplication helpers adapt NumPy 1.26.4's
+ASIMD multiply-add/subtract operation order from:
+https://github.com/numpy/numpy/blob/v1.26.4/numpy/core/src/umath/loops_arithm_fp.dispatch.c.src
+Scalar multiplication and products inside complex power retain their
+distinct installed scalar operation order. Complex destination integer
+casts preserve the installed NumPy cast-loop instruction widths/tails.
+
+The complex arithmetic/ordering policies are compared with NumPy 1.26.4's
+loops.c.src and npy_math_complex.c.src. The FreeBSD-derived complex-math source
+license is retained in NumPy-complex-LICENSE.
+
+The complex sin/cos/sinh/cosh, exp and sqrt component graphs are locally
+authored semantic ports of the installed Apple ARM64 libsystem_m behavior,
+reusing the existing qualified real arithmetic providers. They are not copies
+of NumPy's alternative C99 fallback function bodies. Retained symbol bytes and
+disassembly in the development evidence identify the reference target.

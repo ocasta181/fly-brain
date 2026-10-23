@@ -1,0 +1,19 @@
+The NumPy-target tanh coefficients and scalarized operation order in
+code/mlx_backend/hyperbolic_math64.py and hyperbolic32.py derive from NumPy v1.26.4:
+https://github.com/numpy/numpy/blob/v1.26.4/numpy/core/src/umath/loops_hyperbolic.dispatch.c.src
+
+Copyright (c) 2005-2023, NumPy Developers.
+BSD 3-clause license; see NumPy-LICENSE.
+The upstream file credits NumPy/SVML's tanh algorithm; its BSD license is
+also retained as SVML-hyperbolic-LICENSE.
+
+Local modifications: scalarize the SIMD table lookup and Horner evaluation;
+retain exact native float32 FMA in guarded normal ranges; replace hardware double operations and fused multiply-add with integer-backed
+binary64 Metal operations; preserve NumPy's canonical NaN and target rounding.
+
+The Apple scalar log10/sinh/cosh/tanh helpers are separate reconstructions of
+installed macOS ARM64 operation sequences and numerical coefficients, not
+represented as derivatives of the NumPy source or as a BSD Apple source port.
+The private hyper_fma helper reuses stable_math64's exact arithmetic, including
+Apache-2.0 ArrowMetal-derived final round/pack rules; see
+ArrowMetal-stable-division-NOTICE and ArrowMetal-LICENSE.
