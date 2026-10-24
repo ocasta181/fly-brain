@@ -196,25 +196,25 @@ Recorded warm measurements on an M5 Max with 128 GiB, macOS 26.4 and AC power
 used the complete v783 graph: 138,639 neurons and 15,091,983 edges. Each trial
 simulated one biological second, with spike recording through a closed Parquet file.
 
-| Experiment | Trials | MLX warm seconds | Throughput improvement | MLX real time |
-|---|---:|---:|---:|---:|
-| Sugar | 1 | 0.327 | 1.165x | 3.05x |
-| P9 | 1 | 0.315 | 1.097x | 3.17x |
-| Sugar | 4 | 0.789 | 1.066x | 5.07x |
-| P9 | 4 | 0.773 | 1.045x | 5.18x |
+| Experiment | Trials | MLX warm seconds | MLX real time |
+|---|---:|---:|---:|
+| Sugar | 1 | 0.322 | 3.11x |
+| P9 | 1 | 0.311 | 3.22x |
+| Sugar | 4 | 0.783 | 5.11x |
+| P9 | 4 | 0.767 | 5.22x |
 
-Times are medians of five paired observations per case. Throughput improvement
-is the geometric mean of paired warm-time ratios against the float32 baseline
-at `62bdf9b`, before buffered Parquet output. Both include input generation,
-collection and closed output and exclude setup and compilation. All 20 pairs
-matched state bytes and ordered output exactly. Simultaneous one-sided 95%
-lower bounds for all four improvements exceed 1x; the smallest was 1.036x.
-Four-trial real time denotes aggregate throughput.
+Times are medians of five observations per case, including input generation,
+collection and closed output and excluding setup and compilation. Four-trial
+real time denotes aggregate throughput. Separate paired comparisons showed
+4.5–16.5% higher throughput from buffered Parquet output, followed by another
+1.2–1.7% from removing redundant input synchronization. Each comparison used
+five fixed pairs per case, matched state bytes and ordered output exactly,
+and passed all four simultaneous one-sided 95% improvement lower bounds.
 
-A separate comparison of that baseline against Eon's float64 CPU routes
+A separate comparison of the float32 baseline `62bdf9b` against Eon's CPU routes
 measured 2.83–4.29x speedups: C++ standalone for one trial and four prepared
-Cython workers for four trials. The table above measures the additional
-benefit of buffering; it does not provide new paired CPU ratios or a
+Cython workers for four trials. The table above shows the optimized native
+runtime; it does not provide new paired CPU ratios or a
 same-hardware GeNN comparison.
 
 With matched inputs, a fresh 30-seed whole-graph comparison against Brian

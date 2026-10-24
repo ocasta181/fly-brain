@@ -373,7 +373,9 @@ def run_batch(
     Timings are seconds. ``runtime_s`` includes input generation/staging and
     event collection. ``simulation_s`` is synchronized kernel scheduling and
     execution, including GPU event extraction; input, collection and snapshots
-    are measured separately. ``setup_compile_s`` includes disposable warmup.
+    are measured separately. Input timing covers host generation and array
+    creation; dependent device work completes within ``simulation_s``.
+    ``setup_compile_s`` includes disposable warmup.
     No timing here asserts a CPU speedup or universal Brian float-bit equality.
     """
     setup_start = time.perf_counter()
@@ -511,8 +513,6 @@ def run_batch(
                 else:
                     host_frames = tape[tick:tick + length]
                 frames = mx.array(np.ascontiguousarray(host_frames, dtype=np.uint8))
-                mx.eval(frames)
-                mx.synchronize(stream)
                 timings["input_generation_staging_s"] += time.perf_counter() - started
                 started = time.perf_counter()
                 state, ring, spikes = encode(state, ring, tick, frames, recorder is not None)
