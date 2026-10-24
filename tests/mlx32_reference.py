@@ -98,10 +98,13 @@ def run_reference(
             refractory="rfc",
             method="linear",
             clock=clock,
-            dtype=scalar_dtype,
+            dtype={"v": scalar_dtype, "g": scalar_dtype, "rfc": scalar_dtype,
+                   "lastspike": np.float64},
             namespace=namespace,
             name="mlx32_reference_neurons*",
         )
+        assert np.dtype(neurons.variables["lastspike"].dtype) == np.dtype(np.float64)
+        assert np.dtype(clock.variables["t"].dtype) == np.dtype(np.float64)
         neurons.v = namespace["v_0"]
         neurons.g = 0 * brian.volt
         neurons.rfc = model.refractory_steps * clock.dt
