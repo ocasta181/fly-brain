@@ -192,6 +192,33 @@ uv pip install --python .venv/bin/python -r requirements-mlx32.txt
 .venv/bin/python main.py --mlx32 --experiment p9 --t_run 1 --n_run 1
 ```
 
+Recorded warm measurements on an M5 Max with 128 GiB, macOS 26.4 and AC power
+used the complete v783 graph: 138,639 neurons and 15,091,983 edges. Each trial
+simulated one biological second, with spike recording through a closed Parquet file.
+
+| Experiment | Trials | CPU warm seconds | MLX warm seconds | CPU/MLX speedup | MLX real time |
+|---|---:|---:|---:|---:|---:|
+| Sugar | 1 | 1.533 | 0.383 | 3.98x | 2.61x |
+| P9 | 1 | 1.501 | 0.349 | 4.29x | 2.86x |
+| Sugar | 4 | 2.428 | 0.856 | 2.83x | 4.67x |
+| P9 | 4 | 2.319 | 0.815 | 2.86x | 4.91x |
+
+Times are medians of five paired observations per case; speedups are geometric
+means of the paired CPU/MLX ratios. Both exclude setup and compilation and
+include input generation, collection and output. The CPU uses Eon's float64
+C++ standalone route for one trial and four prepared Cython workers for four
+trials. Four-trial real time denotes aggregate throughput. The simultaneous
+one-sided 95% lower bounds for all four shown speedups exceed 1x;
+the smallest bound was 2.66x. These measurements bind to `a0ca750` and do not
+establish a comparison against GeNN on the same hardware.
+
+With matched inputs, a fresh 30-seed whole-graph comparison against Brian
+float64 passed all 63 predefined readout intervals for named-neuron firing
+rates, population activity, and activation/silencing contrasts. A separate
+800-neuron screen matched all 79,477 spike events across 32 cases. These checks
+qualify the tested readouts and workloads, rather than universal CPU state or
+spike equality.
+
 Trials share the graph and execute as an independent GPU batch. Inputs are
 reproducible for a fixed seed, trial and round; they do not reproduce Brian's
 random-number stream. The adapter uses native float32 state, the model's linear
