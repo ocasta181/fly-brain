@@ -55,12 +55,18 @@ def adapter_case(tmp_path, monkeypatch, native):
 
 
 def assert_native_dispatches(
-    native_launches, before, *, record, state_ticks=10, recorder_calls=2,
+    native_launches, before, *, record, state_ticks=10, state_blocks=2, recorder_calls=2,
 ):
     launches = native_launches[before:]
-    assert launches.count("eon32_state") == state_ticks
-    assert launches.count("eon32_propagate") == state_ticks
-    assert launches.count("eon32_spike_events") == (recorder_calls if record else 0)
+    lengths = [[ticks for name, ticks in launches if name == kernel]
+               for kernel in ("eon32_state", "eon32_propagate")]
+    assert lengths[0] == lengths[1]
+    for blocks in lengths:
+        assert sum(blocks) == state_ticks
+        assert len(blocks) == state_blocks
+    assert [ticks for name, ticks in launches if name == "eon32_spike_events"] == (
+        [1] * recorder_calls if record else []
+    )
 
 
 @pytest.mark.parametrize("row_cap, row_groups", [(None, [4]), (3, [3, 1]), (4, [4])])
@@ -77,7 +83,7 @@ def test_recorded_adapter_schema_events_results_and_csv(
         run_label="adapter_case", round_idx=7,
     )
     assert_native_dispatches(
-        native_launches, before, record=True, state_ticks=8, recorder_calls=5,
+        native_launches, before, record=True, state_ticks=8, state_blocks=5, recorder_calls=5,
     )
     assert len(results) == 1
     result = results[0]
@@ -348,7 +354,7 @@ def test_grid_cache_checks_current_files_and_continues_after_errors(
     assert parses.count(("read_csv", True)) == csv_reads
     assert parses.count(("read_parquet", True)) == con_reads
     assert_native_dispatches(
-        native_launches, before, record=True, state_ticks=20, recorder_calls=4,
+        native_launches, before, record=True, state_ticks=20, state_blocks=4, recorder_calls=4,
     )
     for table in tables:
         assert table.schema == SPIKE_SCHEMA

@@ -198,29 +198,18 @@ simulated one biological second, with spike recording through a closed Parquet f
 
 | Experiment | Trials | MLX warm seconds | MLX real time |
 |---|---:|---:|---:|
-| Sugar | 1 | 0.316 | 3.16x |
-| P9 | 1 | 0.304 | 3.29x |
-| Sugar | 4 | 0.738 | 5.42x |
-| P9 | 4 | 0.723 | 5.54x |
+| Sugar | 1 | 0.193 | 5.17x |
+| P9 | 1 | 0.189 | 5.29x |
+| Sugar | 4 | 0.515 | 7.77x |
+| P9 | 4 | 0.484 | 8.26x |
 
 Times are medians of five observations per case, including input generation,
-collection and closed output and excluding setup and compilation. Four-trial
-real time denotes aggregate throughput. Separate paired comparisons showed
-4.5–16.5% higher throughput from buffered Parquet output, followed by another
-1.2–1.7% from removing redundant input synchronization. Each comparison used
-five fixed pairs per case, matched state bytes and ordered output exactly,
-and passed all four simultaneous one-sided 95% improvement lower bounds.
-
-Packed recording subsequently increased four-trial throughput by 7.2–7.9%, with
-simultaneous one-sided 95% lower bounds above 6%. Single-trial improvement was
-not established; the same intervals bound possible single-trial slowdown below
-1%. All five pairs per case matched state bytes and ordered output exactly.
-
-A separate comparison of the float32 baseline `62bdf9b` against Eon's CPU routes
-measured 2.83–4.29x speedups: C++ standalone for one trial and four prepared
-Cython workers for four trials. The table above shows the optimized native
-runtime; it does not provide new paired CPU ratios or a
-same-hardware GeNN comparison.
+collection, snapshots and closed output and excluding setup and compilation.
+Four-trial real time denotes aggregate throughput. Five fixed alternating
+pairs per case showed 68–71% higher single-trial throughput and 51–52% higher
+four-trial throughput from temporal blocking. All state and ordered output
+bytes matched; all four simultaneous one-sided 95% lower improvement bounds
+exceeded 46%.
 
 With matched inputs, a fresh 30-seed whole-graph comparison against Brian
 float64 passed all 63 predefined readout intervals for named-neuron firing
@@ -238,6 +227,9 @@ The runtime stores voltage relative to rest when a range check permits it,
 improving float32 resolution. Returned voltages remain absolute SI volts.
 With the shipped parameters, quiet intervals use an event-anchored linear
 update to reduce repeated float32 rounding.
+Each state dispatch advances up to `min(delay_steps, 32)` ticks. The fixed
+recurrence delay makes their incoming spike masks available before the block
+starts; each neuron still executes the same updates in chronological order.
 
 Multi-case benchmark grids reuse one immutable host graph to reduce repeated
 setup work. Both input files are verified for every case, and the graph is

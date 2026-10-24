@@ -51,12 +51,16 @@ _STATE_SOURCE = """
     if (i >= n_neurons[0]) return;
     uint trial = thread_position_in_grid.y;
     uint j = trial * n_neurons[0] + i;
-    uint stim_base = trial * uint(stim_row_shape[1]);
-    int r = max(rfc[j] - 1, 0);
+    uint trials = uint(contrib_shape[1]);
+    float anchor_v = v[j], anchor_g = g[j];
+    int r = rfc[j], count = counts[j], k = age[j];
+    for (uint tick = 0; tick < uint(contrib_shape[0]); ++tick) {
+    uint offset = (tick * trials + trial) * n_neurons[0] + i;
+    uint stim_base = (tick * trials + trial) * uint(stim_row_shape[2]);
+    r = max(r - 1, 0);
     bool not_ref = r == 0;
-    int k = age[j];
-    float vi = v[j];
-    float gi = g[j];
+    float vi = anchor_v;
+    float gi = anchor_g;
     if (not_ref) {
         if (span[0] == 1) {
             vi = coefficients[0] + (gi * coefficients[1] + vi * coefficients[2]);
@@ -71,8 +75,8 @@ _STATE_SOURCE = """
     bool sp = not_ref && vi > parameters[0];
     bool delivered = false;
     if (not_ref) {
-        gi = gi + float(contrib[j]) * parameters[1];
-        delivered = contrib[j] != 0;
+        gi = gi + float(contrib[offset]) * parameters[1];
+        delivered = contrib[offset] != 0;
         // A stable channel CSR preserves repeated additions and channel order.
         for (int c = channel_ptr[i]; c < channel_ptr[i + 1]; ++c) {
             if (stim_row[stim_base + uint(channel_order[c])]) {
@@ -87,12 +91,11 @@ _STATE_SOURCE = """
         r = reload[i];
     }
     bool anchored = span[0] == 1 || sp || (not_ref && (delivered || k == 256));
-    v_out[j] = anchored ? vi : v[j];
-    g_out[j] = anchored ? gi : g[j];
-    rfc_out[j] = r;
-    counts_out[j] = counts[j] + (sp ? 1 : 0);
-    age_out[j] = span[0] == 1 || anchored ? 0 : k;
-    spike_out[j] = sp ? 1 : 0;
+    anchor_v = anchored ? vi : anchor_v;
+    anchor_g = anchored ? gi : anchor_g;
+    count = count + (sp ? 1 : 0);
+    k = span[0] == 1 || anchored ? 0 : k;
+    spike_out[offset] = sp ? 1 : 0;
 """
 
 _DECODE_SOURCE = """
@@ -286,9 +289,16 @@ def _kernels(mx, record=False):
         source=_STATE_SOURCE + ("""
     uint word = simd_sum(uint(sp) << (thread_index_in_simdgroup & 31u));
     if ((i & 31u) == 0u) {
-        packed_out[trial * ((n_neurons[0] + 31u) / 32u) + i / 32u] = word;
+        packed_out[(tick * trials + trial) * ((n_neurons[0] + 31u) / 32u) + i / 32u] = word;
     }
-""" if record else ""),
+""" if record else "") + """
+    }
+    v_out[j] = anchor_v;
+    g_out[j] = anchor_g;
+    rfc_out[j] = r;
+    counts_out[j] = count;
+    age_out[j] = k;
+""",
         header="#pragma clang fp contract(off)\n",
         atomic_outputs=False,
     )
@@ -327,14 +337,16 @@ class _Recorder:
         self.total = 0
 
     def submit(self, packed: list, tick: int) -> list:
+        packed = self.mx.concatenate(packed, axis=0)
+        length = packed.shape[0]
         events, count = self.kernel(
-            inputs=[self.mx.stack(packed), self.cap_array],
+            inputs=[packed, self.cap_array],
             output_shapes=[(self.cap, 3), (1,)],
             output_dtypes=[self.mx.int32, self.mx.uint32],
-            grid=((self.n + 31) // 32, len(packed), self.trials), threadgroup=(256, 1, 1),
+            grid=((self.n + 31) // 32, length, self.trials), threadgroup=(256, 1, 1),
             init_value=0, stream=self.stream,
         )
-        self.pending.append((tick, len(packed), events, count))
+        self.pending.append((tick, length, events, count))
         return [events, count]
 
     def drain(self, keep: int = 0) -> None:
@@ -462,7 +474,6 @@ def run_batch(
         span = mx.array([anchor_span], dtype=mx.int32)
         parameters = mx.array([threshold_v, model.weight_v, model.input_v, reset_v], dtype=mx.float32)
         state_shape = (batch, n)
-        state_shapes = [state_shape] * 6 + ([(batch, (n + 31) // 32)] if record else [])
         state_dtypes = [mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8]
         if record:
             state_dtypes.append(mx.uint32)
@@ -478,22 +489,28 @@ def run_batch(
 
         def encode(state, ring, tick, frames, save_spikes):
             spikes = []
-            for offset in range(frames.shape[0]):
-                slot = (tick + offset) % model.delay_steps
+            block_size = min(model.delay_steps, 32)
+            for offset in range(0, frames.shape[0], block_size):
+                length = min(block_size, frames.shape[0] - offset)
+                slots = [(tick + offset + k) % model.delay_steps for k in range(length)]
+                block_shape = (length, batch, n)
                 contrib = propagate(
-                    inputs=[ring[slot], ptr, ends, dst, contacts, count_n],
-                    output_shapes=[state_shape], output_dtypes=[mx.int32],
-                    grid=(n, 8, batch), threadgroup=(256, 1, 1),
+                    inputs=[mx.stack([ring[slot] for slot in slots]), ptr, ends, dst, contacts, count_n],
+                    output_shapes=[block_shape], output_dtypes=[mx.int32],
+                    grid=(n, 8, length * batch), threadgroup=(256, 1, 1),
                     init_value=0, stream=stream,
                 )[0]
                 outputs = state_kernel(
-                    inputs=[*state, contrib, frames[offset], cp, co, rl, count_n,
+                    inputs=[*state, contrib, frames[offset:offset + length], cp, co, rl, count_n,
                             coefficients, parameters, span],
-                    output_shapes=state_shapes, output_dtypes=state_dtypes,
+                    output_shapes=[state_shape] * 5 + [block_shape]
+                                  + ([(length, batch, (n + 31) // 32)] if record else []),
+                    output_dtypes=state_dtypes,
                     grid=(n, batch, 1), threadgroup=(256, 1, 1), stream=stream,
                 )
-                state, spike = outputs[:5], outputs[5]
-                ring[slot] = spike
+                state, history = outputs[:5], outputs[5]
+                for k, slot in enumerate(slots):
+                    ring[slot] = history[k]
                 if save_spikes:
                     spikes.append(outputs[6])
             return state, ring, spikes

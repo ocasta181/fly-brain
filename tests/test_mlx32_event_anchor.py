@@ -118,36 +118,50 @@ def test_span1_matches_exact_native_traces(native, monkeypatch, case):
                       0x7f7fffff, 0xff7fffff, 0x3c23d70a], dtype=np.uint32).view(np.float32)
         g = np.array([0x80000000, 0x80000000, 0, 0x7fc54321, 0x7f800000,
                       0x7f7fffff, 0xff7fffff, 0x80000000], dtype=np.uint32).view(np.float32)
-        actual = [mx.array(v.reshape(shape)), mx.array(g.reshape(shape)),
-                  mx.array([[0, 1, 2, 3, 0, 1, 4, 0]], dtype=mx.int32),
-                  mx.zeros(shape, dtype=mx.int32), mx.zeros(shape, dtype=mx.int32)]
+        initial = [mx.array(v.reshape(shape)), mx.array(g.reshape(shape)),
+                   mx.array([[0, 1, 2, 3, 0, 1, 4, 0]], dtype=mx.int32),
+                   mx.zeros(shape, dtype=mx.int32), mx.zeros(shape, dtype=mx.int32)]
+        actual = initial
         coefficients = mx.array(host_coefficients)
         parameters = mx.array([model.threshold_v - origin, model.weight_v, model.input_v,
                                model.v_reset_v - origin], dtype=mx.float32)
         frames = ([1, 0, 1], [0, 0, 0], [1, 1, 0], [0, 1, 1])
+        contrib = mx.array([[[0, 0, 7, -7, 0, 1, -1, 0]]], dtype=mx.int32)
+        shared = [mx.array([0, 2, 2, 3, 3, 3, 3, 3, 3], dtype=mx.int32),
+                  mx.array([0, 1, 2], dtype=mx.int32),
+                  mx.full((8,), model.refractory_steps, dtype=mx.int32),
+                  mx.array([8], dtype=mx.uint32), coefficients, parameters,
+                  mx.array([span], dtype=mx.int32)]
+        history = []
         for frame, expected_sha256 in zip(frames, _SPAN1_TRACE_SHA256[case], strict=True):
-            shared = [mx.array([[0, 0, 7, -7, 0, 1, -1, 0]], dtype=mx.int32),
-                      mx.array([frame], dtype=mx.uint8),
-                      mx.array([0, 2, 2, 3, 3, 3, 3, 3, 3], dtype=mx.int32),
-                      mx.array([0, 1, 2], dtype=mx.int32),
-                      mx.full((8,), model.refractory_steps, dtype=mx.int32),
-                      mx.array([8], dtype=mx.uint32), coefficients, parameters]
             actual_outputs = state_kernel(
-                inputs=[*actual, *shared, mx.array([span], dtype=mx.int32)],
-                output_shapes=[shape] * 6,
+                inputs=[*actual, contrib, mx.array([[frame]], dtype=mx.uint8), *shared],
+                output_shapes=[shape] * 5 + [(1, *shape)],
                 output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8],
                 grid=(8, 1, 1), threadgroup=(256, 1, 1), stream=stream,
             )
             mx.eval(*actual_outputs)
             arrays = tuple(np.asarray(value) for value in actual_outputs)
             dtypes = (np.float32, np.float32, np.int32, np.int32, np.int32, np.uint8)
-            for value, dtype in zip(arrays, dtypes, strict=True):
+            for index, (value, dtype) in enumerate(zip(arrays, dtypes, strict=True)):
                 assert value.dtype == np.dtype(dtype)
-                assert value.shape == shape
-            raw = b"".join(value.tobytes() for value in arrays[:4] + arrays[5:])
+                assert value.shape == (shape if index < 5 else (1, *shape))
+            raw = b"".join(value.tobytes() for value in arrays[:4] + (arrays[5][0],))
             assert sha256(raw).hexdigest() == expected_sha256
             assert not arrays[4].any()
+            history.append(arrays[5])
             actual = actual_outputs[:5]
+        blocked = state_kernel(
+            inputs=[*initial, mx.concatenate([contrib] * len(frames), axis=0),
+                    mx.array([[frame] for frame in frames], dtype=mx.uint8), *shared],
+            output_shapes=[shape] * 5 + [(len(frames), *shape)],
+            output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8],
+            grid=(8, 1, 1), threadgroup=(256, 1, 1), stream=stream,
+        )
+        mx.eval(*blocked)
+        for value, expected in zip(blocked[:5], arrays[:5], strict=True):
+            assert_bits(value, expected)
+        assert_bits(blocked[5], np.concatenate(history, axis=0))
 
 
 @pytest.mark.metal
@@ -168,19 +182,21 @@ def test_age_boundary_refractory_delivery_reset_and_decode(native):
                  mx.array([[0, 2, 0, 0, 3, 3]], dtype=mx.int32),
                  mx.zeros(shape, dtype=mx.int32),
                  mx.array([[254, 255, 255, 255, 0, 0]], dtype=mx.int32)]
+        initial_state = state
         count_n, coefficients = mx.array([6], dtype=mx.uint32), mx.array(host_coefficients)
-        shared = [mx.array([[0, 0, 1, 1, 0, 0]], dtype=mx.int32),
-                  mx.array([[1, 1]], dtype=mx.uint8),
+        shared = [mx.array([[[0, 0, 1, 1, 0, 0]]], dtype=mx.int32),
+                  mx.array([[[1, 1]]], dtype=mx.uint8),
                   mx.array([0, 0, 0, 1, 2, 2, 2], dtype=mx.int32),
                   mx.array([0, 1], dtype=mx.int32),
                   mx.full((6,), model.refractory_steps, dtype=mx.int32), count_n, coefficients,
                   mx.array([model.threshold_v - model.v_rest_v, model.weight_v,
                             model.input_v, 0], dtype=mx.float32), mx.array([span], dtype=mx.int32)]
-        *state, spikes = state_kernel(
-            inputs=[*state, *shared], output_shapes=[shape] * 6,
+        *state, first_history = state_kernel(
+            inputs=[*state, *shared], output_shapes=[shape] * 5 + [(1, *shape)],
             output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8],
             grid=(6, 1, 1), threadgroup=(256, 1, 1), stream=stream,
         )
+        spikes = first_history[0]
         decoded = decode_kernel(
             inputs=[state[0], state[1], state[4], count_n, coefficients],
             output_shapes=[shape] * 2, output_dtypes=[mx.float32] * 2,
@@ -204,14 +220,27 @@ def test_age_boundary_refractory_delivery_reset_and_decode(native):
         assert np.asarray(state[2])[0, 3] == model.refractory_steps
         assert_bits(np.asarray(decoded[0])[0, 4:], initial[0, 4:])
         assert_bits(np.asarray(decoded[1])[0, 4:], conductance[0, 4:])
-        *state, spikes = state_kernel(
-            inputs=[*state, *shared], output_shapes=[shape] * 6,
+        *state, second_history = state_kernel(
+            inputs=[*state, *shared], output_shapes=[shape] * 5 + [(1, *shape)],
             output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8],
             grid=(6, 1, 1), threadgroup=(256, 1, 1), stream=stream,
         )
+        spikes = second_history[0]
         mx.eval(*state, spikes)
         np.testing.assert_array_equal(np.asarray(state[4]), [[0, 0, 0, 0, 0, 0]])
         np.testing.assert_array_equal(np.asarray(spikes), [[0, 0, 1, 0, 0, 0]])
+        blocked = state_kernel(
+            inputs=[*initial_state, mx.concatenate([shared[0]] * 2, axis=0),
+                    mx.concatenate([shared[1]] * 2, axis=0), *shared[2:]],
+            output_shapes=[shape] * 5 + [(2, *shape)],
+            output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8],
+            grid=(6, 1, 1), threadgroup=(256, 1, 1), stream=stream,
+        )
+        mx.eval(*blocked)
+        for value, expected in zip(blocked[:5], state, strict=True):
+            assert_bits(value, expected)
+        assert_bits(blocked[5], np.concatenate([np.asarray(first_history),
+                                               np.asarray(second_history)], axis=0))
 
 
 @pytest.mark.metal
