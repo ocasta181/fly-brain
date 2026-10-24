@@ -1,6 +1,7 @@
-"""Default-model anchoring and exact native preservation of the retained fallback."""
+"""Default-model anchoring and exact native span1 state traces."""
 
 from dataclasses import asdict
+from hashlib import sha256
 
 import numpy as np
 import pytest
@@ -10,40 +11,40 @@ from mlx32.model import Model
 from mlx32_reference import run_reference
 
 
-# Retained verbatim from f74151907aefa6cf328bb2fda4b81804e276547f.
-_RETAINED_STATE_SOURCE = """
-    uint i = thread_position_in_grid.x;
-    if (i >= n_neurons[0]) return;
-    uint trial = thread_position_in_grid.y;
-    uint j = trial * n_neurons[0] + i;
-    uint stim_base = trial * uint(stim_row_shape[1]);
-    int r = max(rfc[j] - 1, 0);
-    bool not_ref = r == 0;
-    float vi = v[j];
-    float gi = g[j];
-    if (not_ref) {
-        vi = coefficients[0] + (gi * coefficients[1] + vi * coefficients[2]);
-        gi = gi * coefficients[3];
-    }
-    bool sp = not_ref && vi > parameters[0];
-    if (not_ref) {
-        gi = gi + float(contrib[j]) * parameters[1];
-        // A stable channel CSR preserves repeated additions and channel order.
-        for (int c = channel_ptr[i]; c < channel_ptr[i + 1]; ++c) {
-            if (stim_row[stim_base + uint(channel_order[c])]) vi = vi + parameters[2];
-        }
-    }
-    if (sp) {
-        vi = parameters[3];
-        gi = 0.0f;
-        r = reload[i];
-    }
-    v_out[j] = vi;
-    g_out[j] = gi;
-    rfc_out[j] = r;
-    counts_out[j] = counts[j] + (sp ? 1 : 0);
-    spike_out[j] = sp ? 1 : 0;
-"""
+# Per-frame raw v, g, refractory, counts and spikes, in that order.
+# Fixed traces preserve exceptional-value checks without a second state kernel.
+_SPAN1_TRACE_SHA256 = {
+    "absolute": (
+        "6c0c21d15ce6436563f58d44a9e399e9e9355d44132c009f1857a5b85b8b06c4",
+        "5f273fea442ed537db988396d380a49908cf83da7880e601794c87e2e112a1a8",
+        "238e442671d300de61312ec79cbe29194f4168485bd61c800853eb94cd63dd85",
+        "9d5d6915939f56ace56337a8303f031bab0482f1aeedaffed2ba1f829eaaa963",
+    ),
+    "relative": (
+        "f771cbfabaf5d09b7a5fae6c12a96816ce670eda168b0a53175fb7d118a6e8f1",
+        "f98be11af90bdf79ab0cadbbea815804afed8944ffa84b424313ba25e3c771df",
+        "ee5b8f56ba8a2d4af3a2c5017dea835b00954fc65ac60ec87b948538f7357988",
+        "e04f82bccf983c6a7a588d31301864f3e84cb7df04bd9afaa678de968d982932",
+    ),
+    "near_equal": (
+        "629bfa613e6884d3a7baa40cf1658315758e12c76ac759008679d36e846af3c7",
+        "a4bc060b6daf5c15a8a6bef87384b521bef32b7490acafd6d9de2a0b8cb93253",
+        "683aedded99d0a36213a83c499ce8105aa0480f57436b2705678af50a2759498",
+        "1f5889ae39ea1a15f56cc1f4759587677c90cc9ce69c8e6e9ea48cdd03ff764e",
+    ),
+    "overflow": (
+        "629bfa613e6884d3a7baa40cf1658315758e12c76ac759008679d36e846af3c7",
+        "a4bc060b6daf5c15a8a6bef87384b521bef32b7490acafd6d9de2a0b8cb93253",
+        "683aedded99d0a36213a83c499ce8105aa0480f57436b2705678af50a2759498",
+        "81232e0513d1542d9edc1584210a586a35a95928a39bd736cc1451236d2ab869",
+    ),
+    "failed_default_certificate": (
+        "bf9bf1193ce696c88bff04d9c4dd8cfe980460bcea9dac476ad02b5f4fb28fdb",
+        "e72e0c14c25f93f9a627f6310ce5edbe274e52f4f9bd9aae7437e3b7eee292c9",
+        "c9423d1743851d184e2431277bb542784c7d810520f3b1d227504ee390c7e714",
+        "51f09c3d155f39f1d9840b826494435d404461c050c478a0b71171a8bd1a5bdf",
+    ),
+}
 
 
 def assert_bits(actual, expected):
@@ -89,8 +90,8 @@ def test_table_preparation_failure_retains_original_coefficients(monkeypatch, fa
 
 
 @pytest.mark.metal
-@pytest.mark.parametrize("case", ("absolute", "relative", "near_equal", "overflow", "failed_default_certificate"))
-def test_fallback_matches_retained_native_arithmetic(native, monkeypatch, case):
+@pytest.mark.parametrize("case", _SPAN1_TRACE_SHA256)
+def test_span1_matches_exact_native_traces(native, monkeypatch, case):
     import mlx.core as mx
 
     model = {
@@ -112,16 +113,7 @@ def test_fallback_matches_retained_native_arithmetic(native, monkeypatch, case):
     shape = (1, 8)
     stream = mx.new_stream(mx.gpu)
     with mx.stream(stream):
-        candidate = engine._kernels(mx)[1]
-        retained = mx.fast.metal_kernel(
-            name="eon32_retained_f741519",
-            input_names=["v", "g", "rfc", "counts", "contrib", "stim_row",
-                         "channel_ptr", "channel_order", "reload", "n_neurons",
-                         "coefficients", "parameters"],
-            output_names=["v_out", "g_out", "rfc_out", "counts_out", "spike_out"],
-            source=_RETAINED_STATE_SOURCE, header="#pragma clang fp contract(off)\n",
-            atomic_outputs=False,
-        )
+        state_kernel = engine._kernels(mx)[1]
         v = np.array([0x80000000, 0, 0x7f800000, 0xff800000, 0x7fc12345,
                       0x7f7fffff, 0xff7fffff, 0x3c23d70a], dtype=np.uint32).view(np.float32)
         g = np.array([0x80000000, 0x80000000, 0, 0x7fc54321, 0x7f800000,
@@ -129,33 +121,33 @@ def test_fallback_matches_retained_native_arithmetic(native, monkeypatch, case):
         actual = [mx.array(v.reshape(shape)), mx.array(g.reshape(shape)),
                   mx.array([[0, 1, 2, 3, 0, 1, 4, 0]], dtype=mx.int32),
                   mx.zeros(shape, dtype=mx.int32), mx.zeros(shape, dtype=mx.int32)]
-        expected = actual[:4]
         coefficients = mx.array(host_coefficients)
         parameters = mx.array([model.threshold_v - origin, model.weight_v, model.input_v,
                                model.v_reset_v - origin], dtype=mx.float32)
-        for frame in ([1, 0, 1], [0, 0, 0], [1, 1, 0], [0, 1, 1]):
+        frames = ([1, 0, 1], [0, 0, 0], [1, 1, 0], [0, 1, 1])
+        for frame, expected_sha256 in zip(frames, _SPAN1_TRACE_SHA256[case], strict=True):
             shared = [mx.array([[0, 0, 7, -7, 0, 1, -1, 0]], dtype=mx.int32),
                       mx.array([frame], dtype=mx.uint8),
                       mx.array([0, 2, 2, 3, 3, 3, 3, 3, 3], dtype=mx.int32),
                       mx.array([0, 1, 2], dtype=mx.int32),
                       mx.full((8,), model.refractory_steps, dtype=mx.int32),
                       mx.array([8], dtype=mx.uint32), coefficients, parameters]
-            expected_outputs = retained(
-                inputs=[*expected, *shared], output_shapes=[shape] * 5,
-                output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.uint8],
-                grid=(8, 1, 1), threadgroup=(256, 1, 1), stream=stream,
-            )
-            actual_outputs = candidate(
+            actual_outputs = state_kernel(
                 inputs=[*actual, *shared, mx.array([span], dtype=mx.int32)],
                 output_shapes=[shape] * 6,
                 output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8],
                 grid=(8, 1, 1), threadgroup=(256, 1, 1), stream=stream,
             )
-            mx.eval(*actual_outputs, *expected_outputs)
-            for observed, original in zip(actual_outputs[:4] + actual_outputs[5:], expected_outputs):
-                assert_bits(observed, original)
-            assert not np.asarray(actual_outputs[4]).any()
-            actual, expected = actual_outputs[:5], expected_outputs[:4]
+            mx.eval(*actual_outputs)
+            arrays = tuple(np.asarray(value) for value in actual_outputs)
+            dtypes = (np.float32, np.float32, np.int32, np.int32, np.int32, np.uint8)
+            for value, dtype in zip(arrays, dtypes, strict=True):
+                assert value.dtype == np.dtype(dtype)
+                assert value.shape == shape
+            raw = b"".join(value.tobytes() for value in arrays[:4] + arrays[5:])
+            assert sha256(raw).hexdigest() == expected_sha256
+            assert not arrays[4].any()
+            actual = actual_outputs[:5]
 
 
 @pytest.mark.metal
