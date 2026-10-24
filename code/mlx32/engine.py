@@ -8,6 +8,7 @@ propagation, fused tick order and bounded event extraction retain that lineage.
 
 from __future__ import annotations
 
+import math
 import operator
 import time
 from collections import deque
@@ -123,6 +124,42 @@ def _row_end(graph: Graph, silenced: object) -> np.ndarray:
             indices = values.astype(np.int32)
             ends[indices] = graph.row_ptr[indices]
     return ends
+
+
+def _voltage_origin(model: Model, max_incoming_abs: int, max_channels: int) -> float:
+    """Use rest-relative state only when a rounded invariant bounds its range."""
+    rest = model.v_rest_v
+    h, e, q = float(2**120), 2.0**-126, 1.0 + 2.0**-23
+    translated = (model.v_reset_v - rest, model.threshold_v - rest)
+    if not rest or any(not math.isfinite(value) or abs(value) > h
+                       for value in (rest, *translated)):
+        return 0.0
+
+    def add(left: float, right: float) -> float:
+        return math.nextafter(left + right, math.inf)
+
+    def mul(left: float, right: float) -> float:
+        return math.nextafter(left * right, math.inf)
+
+    try:
+        _, b, a, d = map(float, model.coefficients())
+        w, current = map(float, np.array([model.weight_v, model.input_v], dtype=np.float32))
+        denominator = math.nextafter(1.0 - mul(max_channels, 2.0**-23), -math.inf)
+        if denominator <= 0:
+            return 0.0
+        channel_factor = math.nextafter(1.0 / denominator, math.inf)
+        decay_g = add(mul(mul(q, abs(d)), h), e)
+        incoming = add(mul(mul(q, add(mul(q, max_incoming_abs), e)), w), e)
+        conductance = add(mul(q, add(decay_g, incoming)), e)
+        coupling = add(mul(mul(q, abs(b)), h), e)
+        decay_v = add(mul(mul(q, abs(a)), h), e)
+        voltage = add(mul(q, add(coupling, decay_v)), e)
+        voltage = mul(channel_factor, add(voltage, mul(max_channels, add(mul(q, current), e))))
+        if all(math.isfinite(bound) and bound <= h for bound in (conductance, voltage)):
+            return rest
+    except OverflowError:
+        pass
+    return 0.0
 
 
 def _metal():
@@ -286,6 +323,12 @@ def run_batch(
     channel_ptr = np.empty(n + 1, dtype=np.int32)
     channel_ptr[0] = 0
     channel_ptr[1:] = np.cumsum(np.bincount(targets, minlength=n), dtype=np.int64)
+    origin = _voltage_origin(model, graph.max_incoming_abs, int(np.diff(channel_ptr).max(initial=0)))
+    host_coefficients = model.coefficients()
+    initial_v, threshold_v, reset_v = model.v_rest_v, model.threshold_v, model.v_reset_v
+    if origin:
+        host_coefficients[0] = 0.0
+        initial_v, threshold_v, reset_v = (value - origin for value in (initial_v, threshold_v, reset_v))
     reload = np.full(n, model.refractory_steps, dtype=np.int32)
     reload[targets] = 0
     rngs = [
@@ -301,12 +344,12 @@ def run_batch(
         ptr, ends, dst, contacts = map(mx.array, (graph.row_ptr, row_end, graph.destinations, graph.contacts))
         cp, co, rl = map(mx.array, (channel_ptr, channel_order, reload))
         count_n = mx.array([n], dtype=mx.uint32)
-        coefficients = mx.array(model.coefficients(), dtype=mx.float32)
-        parameters = mx.array([model.threshold_v, model.weight_v, model.input_v, model.v_reset_v], dtype=mx.float32)
+        coefficients = mx.array(host_coefficients, dtype=mx.float32)
+        parameters = mx.array([threshold_v, model.weight_v, model.input_v, reset_v], dtype=mx.float32)
         state_shape = (batch, n)
 
         def fresh():
-            state = [mx.full(state_shape, model.v_rest_v, dtype=mx.float32),
+            state = [mx.full(state_shape, initial_v, dtype=mx.float32),
                      mx.zeros(state_shape, dtype=mx.float32),
                      mx.zeros(state_shape, dtype=mx.int32),
                      mx.zeros(state_shape, dtype=mx.int32)]
@@ -384,6 +427,8 @@ def run_batch(
         timings["runtime_s"] = time.perf_counter() - runtime_start
         started = time.perf_counter()
         v, g, refractory, counts = (np.array(np.asarray(value), copy=True) for value in state)
+        if origin:
+            v = (v.astype(np.float64) + origin).astype(np.float32)
         delay_ring = np.array(np.asarray(mx.stack(ring)), dtype=np.bool_, copy=True)
         timings["snapshot_s"] = time.perf_counter() - started
     return RunResult(v, g, refractory, delay_ring, counts, steps, events, timings)

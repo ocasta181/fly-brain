@@ -197,6 +197,8 @@ reproducible for a fixed seed, trial and round; they do not reproduce Brian's
 random-number stream. The adapter uses native float32 state, the model's linear
 update and integer contact counts. Fractional contact data is rejected. This
 backend is specific to this model and does not implement a general Brian device.
+The runtime stores voltage relative to rest when a range check permits it,
+improving float32 resolution. Returned voltages remain absolute SI volts.
 
 The existing recording switch, run labels and result columns also apply.
 Recording streams bounded ordered batches to parquet; `--disable-spike-io`
