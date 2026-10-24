@@ -112,18 +112,23 @@ _DECODE_SOURCE = """
 """
 
 _RECORD_SOURCE = """
-    uint i = thread_position_in_grid.x;
+    uint w = thread_position_in_grid.x;
     uint k = thread_position_in_grid.y;
     uint trial = thread_position_in_grid.z;
-    uint trials = uint(spikes_shape[1]);
-    uint n = uint(spikes_shape[2]);
-    if (i >= n || k >= uint(spikes_shape[0]) || trial >= trials) return;
-    if (!spikes[(k * trials + trial) * n + i]) return;
-    uint slot = atomic_fetch_add_explicit(&count[0], 1u, memory_order_relaxed);
-    if (slot >= cap[0]) return;
-    atomic_store_explicit(&events[3 * slot], int(k), memory_order_relaxed);
-    atomic_store_explicit(&events[3 * slot + 1], int(trial), memory_order_relaxed);
-    atomic_store_explicit(&events[3 * slot + 2], int(i), memory_order_relaxed);
+    uint trials = uint(packed_shape[1]);
+    uint words = uint(packed_shape[2]);
+    if (w >= words || k >= uint(packed_shape[0]) || trial >= trials) return;
+    uint word = packed[(k * trials + trial) * words + w];
+    uint size = popcount(word);
+    if (!size) return;
+    uint slot = atomic_fetch_add_explicit(&count[0], size, memory_order_relaxed);
+    for (uint bit = 0; word && slot < cap[0]; ++bit, word >>= 1u) {
+        if (!(word & 1u)) continue;
+        atomic_store_explicit(&events[3 * slot], int(k), memory_order_relaxed);
+        atomic_store_explicit(&events[3 * slot + 1], int(trial), memory_order_relaxed);
+        atomic_store_explicit(&events[3 * slot + 2], int(32u * w + bit), memory_order_relaxed);
+        ++slot;
+    }
 """
 
 
@@ -263,7 +268,7 @@ def _metal():
     return mx
 
 
-def _kernels(mx):
+def _kernels(mx, record=False):
     propagate = mx.fast.metal_kernel(
         name="eon32_propagate",
         input_names=["spike", "row_ptr", "row_end", "dst", "contacts", "n_neurons"],
@@ -276,19 +281,25 @@ def _kernels(mx):
         input_names=["v", "g", "rfc", "counts", "age", "contrib", "stim_row",
                      "channel_ptr", "channel_order", "reload", "n_neurons",
                      "coefficients", "parameters", "span"],
-        output_names=["v_out", "g_out", "rfc_out", "counts_out", "age_out", "spike_out"],
-        source=_STATE_SOURCE,
+        output_names=["v_out", "g_out", "rfc_out", "counts_out", "age_out", "spike_out"]
+                     + (["packed_out"] if record else []),
+        source=_STATE_SOURCE + ("""
+    uint word = simd_sum(uint(sp) << (thread_index_in_simdgroup & 31u));
+    if ((i & 31u) == 0u) {
+        packed_out[trial * ((n_neurons[0] + 31u) / 32u) + i / 32u] = word;
+    }
+""" if record else ""),
         header="#pragma clang fp contract(off)\n",
         atomic_outputs=False,
     )
-    record = mx.fast.metal_kernel(
+    recorder = mx.fast.metal_kernel(
         name="eon32_spike_events",
-        input_names=["spikes", "cap"],
+        input_names=["packed", "cap"],
         output_names=["events", "count"],
         source=_RECORD_SOURCE,
         atomic_outputs=True,
-    )
-    return propagate, state, record
+    ) if record else None
+    return propagate, state, recorder
 
 
 def _terminal_kernel(mx):
@@ -315,15 +326,15 @@ class _Recorder:
         self.collected: list[np.ndarray] = []
         self.total = 0
 
-    def submit(self, spikes: list, tick: int) -> list:
+    def submit(self, packed: list, tick: int) -> list:
         events, count = self.kernel(
-            inputs=[self.mx.stack(spikes), self.cap_array],
+            inputs=[self.mx.stack(packed), self.cap_array],
             output_shapes=[(self.cap, 3), (1,)],
             output_dtypes=[self.mx.int32, self.mx.uint32],
-            grid=(self.n, len(spikes), self.trials), threadgroup=(256, 1, 1),
+            grid=((self.n + 31) // 32, len(packed), self.trials), threadgroup=(256, 1, 1),
             init_value=0, stream=self.stream,
         )
-        self.pending.append((tick, len(spikes), events, count))
+        self.pending.append((tick, len(packed), events, count))
         return [events, count]
 
     def drain(self, keep: int = 0) -> None:
@@ -442,7 +453,7 @@ def run_batch(
     timings = dict(input_generation_staging_s=0.0, simulation_s=0.0, collection_s=0.0)
 
     with mx.stream(stream):
-        propagate, state_kernel, record_kernel = _kernels(mx)
+        propagate, state_kernel, record_kernel = _kernels(mx, record)
         decode_kernel = _terminal_kernel(mx)
         ptr, ends, dst, contacts = map(mx.array, (graph.row_ptr, row_end, graph.destinations, graph.contacts))
         cp, co, rl = map(mx.array, (channel_ptr, channel_order, reload))
@@ -451,6 +462,10 @@ def run_batch(
         span = mx.array([anchor_span], dtype=mx.int32)
         parameters = mx.array([threshold_v, model.weight_v, model.input_v, reset_v], dtype=mx.float32)
         state_shape = (batch, n)
+        state_shapes = [state_shape] * 6 + ([(batch, (n + 31) // 32)] if record else [])
+        state_dtypes = [mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8]
+        if record:
+            state_dtypes.append(mx.uint32)
 
         def fresh():
             state = [mx.full(state_shape, initial_v, dtype=mx.float32),
@@ -471,16 +486,16 @@ def run_batch(
                     grid=(n, 8, batch), threadgroup=(256, 1, 1),
                     init_value=0, stream=stream,
                 )[0]
-                *state, spike = state_kernel(
+                outputs = state_kernel(
                     inputs=[*state, contrib, frames[offset], cp, co, rl, count_n,
                             coefficients, parameters, span],
-                    output_shapes=[state_shape] * 6,
-                    output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8],
+                    output_shapes=state_shapes, output_dtypes=state_dtypes,
                     grid=(n, batch, 1), threadgroup=(256, 1, 1), stream=stream,
                 )
+                state, spike = outputs[:5], outputs[5]
                 ring[slot] = spike
                 if save_spikes:
-                    spikes.append(spike)
+                    spikes.append(outputs[6])
             return state, ring, spikes
 
         warmup_start = time.perf_counter()

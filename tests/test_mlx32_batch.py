@@ -152,17 +152,21 @@ def test_batch_matches_independent_brian_and_scalar(case, native, record_propert
 
 @pytest.mark.metal
 @pytest.mark.parametrize("chunk_size", [1, 4])
-def test_batch_recording_cap_counts_all_trials(native, chunk_size):
+@pytest.mark.parametrize("n_neurons", [1, 31, 32, 33, 257])
+def test_batch_recording_cap_counts_all_trials(native, chunk_size, n_neurons):
     from mlx32.engine import RecordOverflow
 
     api, _, run_batch_native = native
-    graph = api.make_graph([100], [], [], [])
-    tape = np.zeros((4, 2, 1), dtype=np.uint8)
-    tape[0, :, 0] = 1
+    neurons = np.arange(n_neurons)
+    graph = api.make_graph(100 + neurons, [], [], [])
+    tape = np.zeros((4, 2, n_neurons), dtype=np.uint8)
+    tape[0] = 1
     options = dict(trials=(101, 7), chunk_size=chunk_size, input_tape=tape)
-    drive = api.Drive([0], [100])
-    result = run_batch_native(graph, 4, drive, max_recorded_events=2, **options)
-    np.testing.assert_array_equal(result.spikes, np.array([[1, 0, 0], [1, 1, 0]]))
-    np.testing.assert_array_equal(result.counts, np.ones((2, 1), dtype=np.int64))
+    drive = api.Drive(neurons, np.full(n_neurons, 100))
+    result = run_batch_native(graph, 4, drive, max_recorded_events=2 * n_neurons, **options)
+    expected_events = np.array([[1, position, neuron] for position in range(2)
+                                for neuron in range(n_neurons)], dtype=np.int64)
+    np.testing.assert_array_equal(result.spikes, expected_events)
+    np.testing.assert_array_equal(result.counts, np.ones((2, n_neurons), dtype=np.int64))
     with pytest.raises(RecordOverflow):
-        run_batch_native(graph, 4, drive, max_recorded_events=1, **options)
+        run_batch_native(graph, 4, drive, max_recorded_events=2 * n_neurons - 1, **options)

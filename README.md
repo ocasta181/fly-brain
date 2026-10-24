@@ -198,10 +198,10 @@ simulated one biological second, with spike recording through a closed Parquet f
 
 | Experiment | Trials | MLX warm seconds | MLX real time |
 |---|---:|---:|---:|
-| Sugar | 1 | 0.322 | 3.11x |
-| P9 | 1 | 0.311 | 3.22x |
-| Sugar | 4 | 0.783 | 5.11x |
-| P9 | 4 | 0.767 | 5.22x |
+| Sugar | 1 | 0.316 | 3.16x |
+| P9 | 1 | 0.304 | 3.29x |
+| Sugar | 4 | 0.738 | 5.42x |
+| P9 | 4 | 0.723 | 5.54x |
 
 Times are medians of five observations per case, including input generation,
 collection and closed output and excluding setup and compilation. Four-trial
@@ -210,6 +210,11 @@ real time denotes aggregate throughput. Separate paired comparisons showed
 1.2–1.7% from removing redundant input synchronization. Each comparison used
 five fixed pairs per case, matched state bytes and ordered output exactly,
 and passed all four simultaneous one-sided 95% improvement lower bounds.
+
+Packed recording subsequently increased four-trial throughput by 7.2–7.9%, with
+simultaneous one-sided 95% lower bounds above 6%. Single-trial improvement was
+not established; the same intervals bound possible single-trial slowdown below
+1%. All five pairs per case matched state bytes and ordered output exactly.
 
 A separate comparison of the float32 baseline `62bdf9b` against Eon's CPU routes
 measured 2.83–4.29x speedups: C++ standalone for one trial and four prepared
