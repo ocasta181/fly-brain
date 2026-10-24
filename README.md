@@ -196,21 +196,26 @@ Recorded warm measurements on an M5 Max with 128 GiB, macOS 26.4 and AC power
 used the complete v783 graph: 138,639 neurons and 15,091,983 edges. Each trial
 simulated one biological second, with spike recording through a closed Parquet file.
 
-| Experiment | Trials | CPU warm seconds | MLX warm seconds | CPU/MLX speedup | MLX real time |
-|---|---:|---:|---:|---:|---:|
-| Sugar | 1 | 1.533 | 0.383 | 3.98x | 2.61x |
-| P9 | 1 | 1.501 | 0.349 | 4.29x | 2.86x |
-| Sugar | 4 | 2.428 | 0.856 | 2.83x | 4.67x |
-| P9 | 4 | 2.319 | 0.815 | 2.86x | 4.91x |
+| Experiment | Trials | MLX warm seconds | Throughput improvement | MLX real time |
+|---|---:|---:|---:|---:|
+| Sugar | 1 | 0.327 | 1.165x | 3.05x |
+| P9 | 1 | 0.315 | 1.097x | 3.17x |
+| Sugar | 4 | 0.789 | 1.066x | 5.07x |
+| P9 | 4 | 0.773 | 1.045x | 5.18x |
 
-Times are medians of five paired observations per case; speedups are geometric
-means of the paired CPU/MLX ratios. Both exclude setup and compilation and
-include input generation, collection and output. The CPU uses Eon's float64
-C++ standalone route for one trial and four prepared Cython workers for four
-trials. Four-trial real time denotes aggregate throughput. The simultaneous
-one-sided 95% lower bounds for all four shown speedups exceed 1x;
-the smallest bound was 2.66x. These measurements bind to `a0ca750` and do not
-establish a comparison against GeNN on the same hardware.
+Times are medians of five paired observations per case. Throughput improvement
+is the geometric mean of paired warm-time ratios against the float32 baseline
+at `62bdf9b`, before buffered Parquet output. Both include input generation,
+collection and closed output and exclude setup and compilation. All 20 pairs
+matched state bytes and ordered output exactly. Simultaneous one-sided 95%
+lower bounds for all four improvements exceed 1x; the smallest was 1.036x.
+Four-trial real time denotes aggregate throughput.
+
+A separate comparison of that baseline against Eon's float64 CPU routes
+measured 2.83–4.29x speedups: C++ standalone for one trial and four prepared
+Cython workers for four trials. The table above measures the additional
+benefit of buffering; it does not provide new paired CPU ratios or a
+same-hardware GeNN comparison.
 
 With matched inputs, a fresh 30-seed whole-graph comparison against Brian
 float64 passed all 63 predefined readout intervals for named-neuron firing
@@ -230,7 +235,8 @@ With the shipped parameters, quiet intervals use an event-anchored linear
 update to reduce repeated float32 rounding.
 
 The existing recording switch, run labels and result columns also apply.
-Recording streams bounded ordered batches to parquet; `--disable-spike-io`
+Recording coalesces ordered batches into bounded 65,536-row Parquet groups;
+`--disable-spike-io`
 omits the spike file. Warm execution, input staging, collection and setup costs
 are reported separately. MLX requires an available Metal GPU and has no CPU
 fallback. The runtime adapts selected MIT-licensed Kisame76 code; attribution and

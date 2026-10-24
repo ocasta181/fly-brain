@@ -38,7 +38,8 @@ def run_single_benchmark(
 
     CSV simulation time is synchronized native execution, including GPU spike
     extraction. Input staging, host collection and export have separate timers.
-    ``runtime_s`` includes those runtime costs and overlaps their phase timers.
+    ``runtime_s`` includes in-native collection/export; the final Parquet flush
+    and close appear only in the result timers.
     """
     started = time()
     timings = {}
@@ -143,30 +144,51 @@ def run_single_benchmark(
             temporary_path = Path(temporary_name)
             os.close(fd)
             writer = pq.ParquetWriter(temporary_path, schema, compression='brotli')
+            event_buffer = np.empty((_ARROW_ROWS, 3), dtype=np.int64)
+            buffered_rows = 0
 
         timings['output_setup'] = time() - output_setup_start
 
+        def flush_spikes() -> None:
+            nonlocal buffered_rows, rows_written, sink_collection_s, sink_export_s
+            if not buffered_rows:
+                return
+            batch = event_buffer[:buffered_rows]
+            collection_start = time()
+            try:
+                seconds = batch[:, 0].astype(np.float64) * model.dt_s
+                table = pa.Table.from_arrays([
+                    pa.array(seconds), pa.array(seconds * 1000.0),
+                    pa.array(batch[:, 1]), pa.array(batch[:, 2]),
+                    pa.array(graph.neuron_ids[batch[:, 2]]),
+                    pa.array([exp_name] * len(batch), type=pa.string()),
+                ], schema=schema)
+            finally:
+                sink_collection_s += time() - collection_start
+            export_start = time()
+            try:
+                writer.write_table(table, row_group_size=_ARROW_ROWS)
+            finally:
+                sink_export_s += time() - export_start
+            rows_written += buffered_rows
+            buffered_rows = 0
+
         def write_spikes(events: np.ndarray) -> None:
-            nonlocal rows_written, sink_collection_s, sink_export_s
-            for offset in range(0, len(events), _ARROW_ROWS):
-                batch = events[offset:offset + _ARROW_ROWS]
+            nonlocal buffered_rows, sink_collection_s
+            offset = 0
+            while offset < len(events):
                 collection_start = time()
                 try:
-                    seconds = batch[:, 0].astype(np.float64) * model.dt_s
-                    table = pa.Table.from_arrays([
-                        pa.array(seconds), pa.array(seconds * 1000.0),
-                        pa.array(batch[:, 1]), pa.array(batch[:, 2]),
-                        pa.array(graph.neuron_ids[batch[:, 2]]),
-                        pa.array([exp_name] * len(batch), type=pa.string()),
-                    ], schema=schema)
+                    length = min(_ARROW_ROWS - buffered_rows, len(events) - offset)
+                    event_buffer[buffered_rows:buffered_rows + length] = (
+                        events[offset:offset + length]
+                    )
+                    buffered_rows += length
+                    offset += length
                 finally:
                     sink_collection_s += time() - collection_start
-                export_start = time()
-                try:
-                    writer.write_table(table, row_group_size=_ARROW_ROWS)
-                finally:
-                    sink_export_s += time() - export_start
-                rows_written += len(batch)
+                if buffered_rows == _ARROW_ROWS:
+                    flush_spikes()
 
         run_start = time()
         try:
@@ -186,9 +208,12 @@ def run_single_benchmark(
         )
         timings['device_build'] = native.timings['compile_warmup_s']
         timings['simulation_total'] = native.timings['simulation_s']
+        timings['sink_in_native'] = sink_collection_s + sink_export_s
         timings['spike_extraction_total'] = max(
-            0.0, native.timings['collection_s'] - sink_collection_s - sink_export_s,
+            0.0, native.timings['collection_s'] - timings['sink_in_native'],
         )
+        if record_spikes:
+            flush_spikes()
 
         summary_start = time()
         if record_spikes:

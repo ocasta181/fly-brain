@@ -10,6 +10,13 @@ import pyarrow.parquet as pq
 import pytest
 
 
+SPIKE_SCHEMA = pa.schema([
+    ("t", pa.float64()), ("time_ms", pa.float64()), ("trial", pa.int64()),
+    ("neuron_index", pa.int64()), ("flywire_id", pa.int64()),
+    ("exp_name", pa.string()),
+])
+
+
 @pytest.fixture
 def adapter_case(tmp_path, monkeypatch, native):
     import benchmark
@@ -44,24 +51,31 @@ def adapter_case(tmp_path, monkeypatch, native):
     return adapter, benchmark, experiment, ids
 
 
-def assert_native_dispatches(native_launches, before, *, record):
+def assert_native_dispatches(
+    native_launches, before, *, record, state_ticks=10, recorder_calls=2,
+):
     launches = native_launches[before:]
-    # Five disposable warmup ticks plus five requested ticks, independent of B=2.
-    assert launches.count("eon32_state") == 10
-    assert launches.count("eon32_propagate") == 10
-    assert launches.count("eon32_spike_events") == (2 if record else 0)
+    assert launches.count("eon32_state") == state_ticks
+    assert launches.count("eon32_propagate") == state_ticks
+    assert launches.count("eon32_spike_events") == (recorder_calls if record else 0)
 
 
+@pytest.mark.parametrize("row_cap, row_groups", [(None, [4]), (3, [3, 1]), (4, [4])])
 def test_recorded_adapter_schema_events_results_and_csv(
-    adapter_case, native, native_launches,
+    adapter_case, monkeypatch, native, native_launches, row_cap, row_groups,
 ):
     adapter, benchmark, experiment, ids = adapter_case
+    monkeypatch.setattr(adapter, "_CHUNK_SIZE", 2)
+    if row_cap is not None:
+        monkeypatch.setattr(adapter, "_ARROW_ROWS", row_cap)
     before = len(native_launches)
     results = adapter.run_all_benchmarks(
         [0.0005], [2], experiment, benchmark.BenchmarkLogger(),
         run_label="adapter_case", round_idx=7,
     )
-    assert_native_dispatches(native_launches, before, record=True)
+    assert_native_dispatches(
+        native_launches, before, record=True, state_ticks=8, recorder_calls=5,
+    )
     assert len(results) == 1
     result = results[0]
     target = benchmark.get_spike_output_path("mlx32_t0.0005s_n2", "adapter_case", 7)
@@ -73,12 +87,13 @@ def test_recorded_adapter_schema_events_results_and_csv(
     }
     with pq.ParquetFile(target) as stored:
         assert stored.metadata.num_rows == 4
+        assert [stored.metadata.row_group(i).num_rows
+                for i in range(stored.metadata.num_row_groups)] == row_groups
+        assert all(stored.metadata.row_group(i).column(j).compression == "BROTLI"
+                   for i in range(stored.metadata.num_row_groups)
+                   for j in range(len(SPIKE_SCHEMA)))
         table = stored.read()
-    assert table.schema == pa.schema([
-        ("t", pa.float64()), ("time_ms", pa.float64()), ("trial", pa.int64()),
-        ("neuron_index", pa.int64()), ("flywire_id", pa.int64()),
-        ("exp_name", pa.string()),
-    ])
+    assert table.schema == SPIKE_SCHEMA
     expected_seconds = np.array([1, 1, 3, 3]) * 0.0001
     np.testing.assert_array_equal(table["t"].to_numpy(), expected_seconds)
     np.testing.assert_array_equal(table["time_ms"].to_numpy(), expected_seconds * 1000)
@@ -96,8 +111,13 @@ def test_recorded_adapter_schema_events_results_and_csv(
         timings["adapter_setup"] + timings["setup_compile_s"]
     )
     assert timings["spike_extraction_total"] == max(
-        0, timings["collection_s"] - timings["sink_collection"] - timings["sink_export"]
+        0, timings["collection_s"] - timings["sink_in_native"]
     )
+    total_sink = timings["sink_collection"] + timings["sink_export"]
+    if row_cap is not None and 4 % row_cap == 0:
+        assert timings["sink_in_native"] == total_sink
+    else:
+        assert timings["sink_in_native"] < total_sink
     assert timings["result_collection"] >= timings["sink_collection"] + timings["snapshot_s"]
     assert timings["result_save"] >= timings["output_setup"] + timings["sink_export"]
     assert timings["runtime_s"] >= sum(timings[key] for key in (
@@ -157,8 +177,29 @@ def test_record_off_runs_metal_without_spike_output(
     assert not benchmark.path_res.exists()
 
 
+def test_recorded_zero_events_publishes_empty_parquet(
+    adapter_case, native, native_launches,
+):
+    adapter, benchmark, experiment, _ = adapter_case
+    before = len(native_launches)
+    result = adapter.run_single_benchmark(
+        0.0005, 2, dict(experiment, stim_rate=0.0), benchmark.BenchmarkLogger(),
+    )
+    assert_native_dispatches(native_launches, before, record=True)
+    assert result["status"] == "success"
+    assert result["n_spikes"] == result["n_active_neurons"] == 0
+    target = benchmark.get_spike_output_path("mlx32_t0.0005s_n2")
+    assert result["spike_path"] == str(target)
+    with pq.ParquetFile(target) as stored:
+        assert stored.schema_arrow == SPIKE_SCHEMA
+        assert stored.metadata.num_rows == stored.metadata.num_row_groups == 0
+    assert result["timings"]["sink_collection"] == result["timings"]["sink_export"] == 0
+    assert list(target.parent.iterdir()) == [target]
+
+
+@pytest.mark.parametrize("failure", ["stream", "tail", "close"])
 def test_export_failure_preserves_target_and_removes_own_temporary_file(
-    adapter_case, monkeypatch, native, native_launches,
+    adapter_case, monkeypatch, native, native_launches, failure,
 ):
     adapter, benchmark, experiment, _ = adapter_case
     target = benchmark.get_spike_output_path("mlx32_t0.0005s_n2")
@@ -168,14 +209,14 @@ def test_export_failure_preserves_target_and_removes_own_temporary_file(
     real_writer = pq.ParquetWriter
     writers = []
 
-    class FailAfterWrite:
+    class FailingWriter:
         def __init__(self, *args, **kwargs):
             self.writer = real_writer(*args, **kwargs)
             self.writes = self.closes = 0
             writers.append(self)
 
         def write_table(self, table, **kwargs):
-            if self.writes:
+            if failure == "tail" or (failure == "stream" and self.writes):
                 raise OSError("injected parquet export failure")
             self.writer.write_table(table, **kwargs)
             self.writes += 1
@@ -183,18 +224,26 @@ def test_export_failure_preserves_target_and_removes_own_temporary_file(
         def close(self):
             self.closes += 1
             self.writer.close()
+            if failure == "close":
+                raise OSError("injected parquet close failure")
 
-    monkeypatch.setattr(adapter, "_ARROW_ROWS", 1)
-    monkeypatch.setattr(pq, "ParquetWriter", FailAfterWrite)
+    if failure == "stream":
+        monkeypatch.setattr(adapter, "_ARROW_ROWS", 1)
+    monkeypatch.setattr(pq, "ParquetWriter", FailingWriter)
     before = len(native_launches)
     result = adapter.run_single_benchmark(
         0.0005, 2, experiment, benchmark.BenchmarkLogger(),
     )
     assert_native_dispatches(native_launches, before, record=True)
-    assert result["status"] == "error: injected parquet export failure"
+    assert result["status"] == (
+        "error: parquet close failed: injected parquet close failure"
+        if failure == "close" else "error: injected parquet export failure"
+    )
     assert result["n_spikes"] == result["n_active_neurons"] == 0
     assert result["spike_path"] == ""
     assert len(writers) == 1
-    assert writers[0].writes == writers[0].closes == 1
+    assert (writers[0].writes, writers[0].closes) == {
+        "stream": (1, 1), "tail": (0, 1), "close": (1, 2),
+    }[failure]
     assert target.read_bytes() == original
     assert list(target.parent.iterdir()) == [target]
