@@ -199,6 +199,8 @@ update and integer contact counts. Fractional contact data is rejected. This
 backend is specific to this model and does not implement a general Brian device.
 The runtime stores voltage relative to rest when a range check permits it,
 improving float32 resolution. Returned voltages remain absolute SI volts.
+With the shipped parameters, quiet intervals use an event-anchored linear
+update to reduce repeated float32 rounding.
 
 The existing recording switch, run labels and result columns also apply.
 Recording streams bounded ordered batches to parquet; `--disable-spike-io`

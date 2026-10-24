@@ -54,18 +54,31 @@ _STATE_SOURCE = """
     uint stim_base = trial * uint(stim_row_shape[1]);
     int r = max(rfc[j] - 1, 0);
     bool not_ref = r == 0;
+    int k = age[j];
     float vi = v[j];
     float gi = g[j];
     if (not_ref) {
-        vi = coefficients[0] + (gi * coefficients[1] + vi * coefficients[2]);
-        gi = gi * coefficients[3];
+        if (span[0] == 1) {
+            vi = coefficients[0] + (gi * coefficients[1] + vi * coefficients[2]);
+            gi = gi * coefficients[3];
+        } else {
+            int row = 4 + 3 * k;
+            k += 1;
+            vi = gi * coefficients[row + 1] + vi * coefficients[row];
+            gi = gi * coefficients[row + 2];
+        }
     }
     bool sp = not_ref && vi > parameters[0];
+    bool delivered = false;
     if (not_ref) {
         gi = gi + float(contrib[j]) * parameters[1];
+        delivered = contrib[j] != 0;
         // A stable channel CSR preserves repeated additions and channel order.
         for (int c = channel_ptr[i]; c < channel_ptr[i + 1]; ++c) {
-            if (stim_row[stim_base + uint(channel_order[c])]) vi = vi + parameters[2];
+            if (stim_row[stim_base + uint(channel_order[c])]) {
+                vi = vi + parameters[2];
+                delivered = true;
+            }
         }
     }
     if (sp) {
@@ -73,11 +86,29 @@ _STATE_SOURCE = """
         gi = 0.0f;
         r = reload[i];
     }
-    v_out[j] = vi;
-    g_out[j] = gi;
+    bool anchored = span[0] == 1 || sp || (not_ref && (delivered || k == 256));
+    v_out[j] = anchored ? vi : v[j];
+    g_out[j] = anchored ? gi : g[j];
     rfc_out[j] = r;
     counts_out[j] = counts[j] + (sp ? 1 : 0);
+    age_out[j] = span[0] == 1 || anchored ? 0 : k;
     spike_out[j] = sp ? 1 : 0;
+"""
+
+_DECODE_SOURCE = """
+    uint i = thread_position_in_grid.x;
+    if (i >= n_neurons[0]) return;
+    uint j = thread_position_in_grid.y * n_neurons[0] + i;
+    int k = age[j];
+    float vi = v[j];
+    float gi = g[j];
+    if (k != 0) {
+        int row = 4 + 3 * (k - 1);
+        vi = gi * coefficients[row + 1] + vi * coefficients[row];
+        gi = gi * coefficients[row + 2];
+    }
+    u_out[j] = vi;
+    g_out[j] = gi;
 """
 
 _RECORD_SOURCE = """
@@ -162,6 +193,66 @@ def _voltage_origin(model: Model, max_incoming_abs: int, max_channels: int) -> f
     return 0.0
 
 
+def _anchor_table(model: Model) -> np.ndarray:
+    rows = []
+    for k in range(1, 257):
+        a = math.exp(-k * model.dt_s / model.tau_m_s)
+        d = math.exp(-k * model.dt_s / model.tau_g_s)
+        b = model.tau_g_s * (a - d) / (model.tau_m_s - model.tau_g_s)
+        rows.append((a, b, d))
+    return np.array(rows, dtype=np.float32)
+
+
+def _anchor_coefficients(
+    model: Model, origin: float, max_incoming_abs: int, max_channels: int,
+) -> tuple[np.ndarray, int]:
+    coefficients = np.zeros(4 + 3 * 256, dtype=np.float32)
+    coefficients[:4] = model.coefficients()
+    if origin:
+        coefficients[0] = 0.0
+    if model != Model() or origin != model.v_rest_v:
+        return coefficients, 1
+    h, e, q = float(2**120), 2.0**-126, 1.0 + 2.0**-23
+
+    def add(left: float, right: float) -> float:
+        return math.nextafter(left + right, math.inf)
+
+    def mul(left: float, right: float) -> float:
+        return math.nextafter(left * right, math.inf)
+
+    def rounded(value: float) -> float:
+        return add(mul(q, value), e)
+
+    try:
+        with np.errstate(over="raise", invalid="raise"):
+            table = _anchor_table(model)
+            initial, reset, threshold, weight, current = map(float, np.array([
+                model.v_rest_v - origin, model.v_reset_v - origin,
+                model.threshold_v - origin, model.weight_v, model.input_v,
+            ], dtype=np.float32))
+        if not np.isfinite(table).all() or any(not math.isfinite(value) or abs(value) > h
+                                              for value in (initial, reset, threshold)):
+            return coefficients, 1
+        denominator = math.nextafter(1.0 - mul(max_channels, 2.0**-23), -math.inf)
+        if denominator <= 0:
+            return coefficients, 1
+        channel_factor = math.nextafter(1.0 / denominator, math.inf)
+        voltage = conductance = 0.0
+        for a, b, d in table:
+            a, b, d = float(a), float(b), float(d)
+            voltage = max(voltage, rounded(add(rounded(mul(abs(b), h)), rounded(mul(abs(a), h)))))
+            conductance = max(conductance, rounded(mul(abs(d), h)))
+        incoming = rounded(mul(rounded(max_incoming_abs), weight))
+        bounds = (rounded(add(conductance, incoming)),
+                  mul(channel_factor, add(voltage, mul(max_channels, rounded(current)))))
+        if all(math.isfinite(bound) and bound <= h for bound in bounds):
+            coefficients[4:] = table.ravel()
+            return coefficients, 256
+    except (ArithmeticError, TypeError, ValueError):
+        pass
+    return coefficients, 1
+
+
 def _metal():
     try:
         import mlx.core as mx
@@ -182,10 +273,10 @@ def _kernels(mx):
     )
     state = mx.fast.metal_kernel(
         name="eon32_state",
-        input_names=["v", "g", "rfc", "counts", "contrib", "stim_row",
+        input_names=["v", "g", "rfc", "counts", "age", "contrib", "stim_row",
                      "channel_ptr", "channel_order", "reload", "n_neurons",
-                     "coefficients", "parameters"],
-        output_names=["v_out", "g_out", "rfc_out", "counts_out", "spike_out"],
+                     "coefficients", "parameters", "span"],
+        output_names=["v_out", "g_out", "rfc_out", "counts_out", "age_out", "spike_out"],
         source=_STATE_SOURCE,
         header="#pragma clang fp contract(off)\n",
         atomic_outputs=False,
@@ -198,6 +289,15 @@ def _kernels(mx):
         atomic_outputs=True,
     )
     return propagate, state, record
+
+
+def _terminal_kernel(mx):
+    return mx.fast.metal_kernel(
+        name="eon32_event_anchor_decode",
+        input_names=["v", "g", "age", "n_neurons", "coefficients"],
+        output_names=["u_out", "g_out"], source=_DECODE_SOURCE,
+        header="#pragma clang fp contract(off)\n", atomic_outputs=False,
+    )
 
 
 class RecordOverflow(RuntimeError):
@@ -323,11 +423,11 @@ def run_batch(
     channel_ptr = np.empty(n + 1, dtype=np.int32)
     channel_ptr[0] = 0
     channel_ptr[1:] = np.cumsum(np.bincount(targets, minlength=n), dtype=np.int64)
-    origin = _voltage_origin(model, graph.max_incoming_abs, int(np.diff(channel_ptr).max(initial=0)))
-    host_coefficients = model.coefficients()
+    max_channels = int(np.diff(channel_ptr).max(initial=0))
+    origin = _voltage_origin(model, graph.max_incoming_abs, max_channels)
+    host_coefficients, anchor_span = _anchor_coefficients(model, origin, graph.max_incoming_abs, max_channels)
     initial_v, threshold_v, reset_v = model.v_rest_v, model.threshold_v, model.v_reset_v
     if origin:
-        host_coefficients[0] = 0.0
         initial_v, threshold_v, reset_v = (value - origin for value in (initial_v, threshold_v, reset_v))
     reload = np.full(n, model.refractory_steps, dtype=np.int32)
     reload[targets] = 0
@@ -341,16 +441,19 @@ def run_batch(
 
     with mx.stream(stream):
         propagate, state_kernel, record_kernel = _kernels(mx)
+        decode_kernel = _terminal_kernel(mx)
         ptr, ends, dst, contacts = map(mx.array, (graph.row_ptr, row_end, graph.destinations, graph.contacts))
         cp, co, rl = map(mx.array, (channel_ptr, channel_order, reload))
         count_n = mx.array([n], dtype=mx.uint32)
         coefficients = mx.array(host_coefficients, dtype=mx.float32)
+        span = mx.array([anchor_span], dtype=mx.int32)
         parameters = mx.array([threshold_v, model.weight_v, model.input_v, reset_v], dtype=mx.float32)
         state_shape = (batch, n)
 
         def fresh():
             state = [mx.full(state_shape, initial_v, dtype=mx.float32),
                      mx.zeros(state_shape, dtype=mx.float32),
+                     mx.zeros(state_shape, dtype=mx.int32),
                      mx.zeros(state_shape, dtype=mx.int32),
                      mx.zeros(state_shape, dtype=mx.int32)]
             ring = [mx.zeros(state_shape, dtype=mx.uint8) for _ in range(model.delay_steps)]
@@ -368,9 +471,9 @@ def run_batch(
                 )[0]
                 *state, spike = state_kernel(
                     inputs=[*state, contrib, frames[offset], cp, co, rl, count_n,
-                            coefficients, parameters],
-                    output_shapes=[state_shape] * 5,
-                    output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.uint8],
+                            coefficients, parameters, span],
+                    output_shapes=[state_shape] * 6,
+                    output_dtypes=[mx.float32, mx.float32, mx.int32, mx.int32, mx.int32, mx.uint8],
                     grid=(n, batch, 1), threadgroup=(256, 1, 1), stream=stream,
                 )
                 ring[slot] = spike
@@ -392,7 +495,7 @@ def run_batch(
         timings["compile_warmup_s"] = time.perf_counter() - warmup_start
         state, ring = fresh()
         recorder = _Recorder(mx, record_kernel, stream, n, batch, limit, spike_sink) if record and n else None
-        mx.eval(*state, *ring, ptr, ends, dst, contacts, cp, co, rl, count_n, coefficients, parameters)
+        mx.eval(*state, *ring, ptr, ends, dst, contacts, cp, co, rl, count_n, coefficients, parameters, span)
         mx.synchronize(stream)
         timings["setup_compile_s"] = time.perf_counter() - setup_start
 
@@ -426,7 +529,17 @@ def run_batch(
         timings["collection_s"] += time.perf_counter() - started
         timings["runtime_s"] = time.perf_counter() - runtime_start
         started = time.perf_counter()
-        v, g, refractory, counts = (np.array(np.asarray(value), copy=True) for value in state)
+        decoded = state[:2]
+        if n and anchor_span == 256:
+            decoded = decode_kernel(
+                inputs=[state[0], state[1], state[4], count_n, coefficients],
+                output_shapes=[state_shape] * 2, output_dtypes=[mx.float32] * 2,
+                grid=(n, batch, 1), threadgroup=(256, 1, 1), stream=stream,
+            )
+            mx.eval(*decoded)
+            mx.synchronize(stream)
+        v, g = (np.array(np.asarray(value), copy=True) for value in decoded)
+        refractory, counts = (np.array(np.asarray(value), copy=True) for value in state[2:4])
         if origin:
             v = (v.astype(np.float64) + origin).astype(np.float32)
         delay_ring = np.array(np.asarray(mx.stack(ring)), dtype=np.bool_, copy=True)
