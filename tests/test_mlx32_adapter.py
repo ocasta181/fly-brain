@@ -1,7 +1,10 @@
 """Tiny file-to-Metal adapter checks with literal discrete spike expectations."""
 
+import builtins
 import csv
 import math
+import os
+from io import BytesIO
 
 import numpy as np
 import pandas as pd
@@ -247,3 +250,171 @@ def test_export_failure_preserves_target_and_removes_own_temporary_file(
     }[failure]
     assert target.read_bytes() == original
     assert list(target.parent.iterdir()) == [target]
+
+
+@pytest.fixture
+def graph_calls(monkeypatch, native):
+    from mlx32 import engine, model
+
+    builds, runs, parses = [], [], []
+    real_make_graph, real_run = model.make_graph, engine.run_batch
+
+    def make_graph(*args):
+        graph = real_make_graph(*args)
+        builds.append(graph)
+        return graph
+
+    def run_batch(graph, *args, **kwargs):
+        runs.append(graph)
+        return real_run(graph, *args, **kwargs)
+
+    for name in ("read_csv", "read_parquet"):
+        def read(source, *args, _name=name, _read=getattr(pd, name), **kwargs):
+            parses.append((_name, isinstance(source, BytesIO)))
+            return _read(source, *args, **kwargs)
+        monkeypatch.setattr(pd, name, read)
+    monkeypatch.setattr(model, "make_graph", make_graph)
+    monkeypatch.setattr(engine, "run_batch", run_batch)
+    return builds, runs, parses
+
+
+@pytest.mark.parametrize("source, change", [
+    ("comp", "same"), ("comp", "rewrite"), ("con", "rewrite"),
+    ("comp", "missing"), ("con", "missing"),
+    ("comp", "corrupt"), ("con", "corrupt"), ("comp", "csv_first"),
+])
+def test_grid_cache_checks_current_files_and_continues_after_errors(
+    adapter_case, monkeypatch, graph_calls, native_launches, capsys, source, change,
+):
+    adapter, benchmark, experiment, ids = adapter_case
+    builds, runs, parses = graph_calls
+    path = adapter.path_comp if source == "comp" else adapter.path_con
+    if source == "con":
+        pd.DataFrame({"Presynaptic_Index": [0], "Postsynaptic_Index": [1],
+                      "Excitatory x Connectivity": [1]}).to_parquet(
+            path, index=False, compression=None,
+        )
+    original, stat = path.read_bytes(), path.stat()
+    connectivity = adapter.path_con.read_bytes()
+    if change == "rewrite":
+        if source == "comp":
+            lines = original.splitlines(keepends=True)
+            replacement = b"".join([lines[0], lines[2], lines[1]])
+        else:
+            pd.DataFrame({"Presynaptic_Index": [0], "Postsynaptic_Index": [1],
+                          "Excitatory x Connectivity": [2]}).to_parquet(
+                path, index=False, compression=None,
+            )
+            replacement = path.read_bytes()
+            path.write_bytes(original)
+        assert len(replacement) == len(original)
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    failure = change in {"missing", "corrupt", "csv_first"}
+    saved, tables = [], []
+    real_save = adapter.save_result_csv
+
+    def save(backend, result):
+        real_save(backend, result)
+        saved.append(result)
+        if result["spike_path"]:
+            tables.append(pq.read_table(result["spike_path"]))
+        if len(saved) == 1:
+            if change in {"missing", "csv_first"}:
+                (adapter.path_con if change == "csv_first" else path).unlink()
+            if change in {"corrupt", "csv_first", "rewrite"}:
+                path.write_bytes(replacement if change == "rewrite" else b"")
+            if change == "rewrite":
+                os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+                assert path.stat().st_mtime_ns == stat.st_mtime_ns
+        elif len(saved) == 2 and failure:
+            path.write_bytes(original)
+            adapter.path_con.write_bytes(connectivity)
+
+    monkeypatch.setattr(adapter, "save_result_csv", save)
+    before = len(native_launches)
+    results = adapter.run_all_benchmarks(
+        [0.0005] * (3 if failure else 2), [2], experiment, benchmark.BenchmarkLogger(),
+    )
+    assert results == saved
+    assert results[0]["status"] == results[-1]["status"] == "success"
+    if failure:
+        assert results[1]["status"].startswith("error:")
+    assert len(builds) == (2 if change == "rewrite" else 1)
+    assert len(runs) == len(tables) == 2
+    assert (runs[0] is runs[1]) == (change != "rewrite")
+    assert all(snapshot for _, snapshot in parses)
+    csv_reads = 2 if change == "missing" and source == "comp" else len(results)
+    con_reads = 2 if change == "rewrite" or (change == "corrupt" and source == "con") else 1
+    assert parses.count(("read_csv", True)) == csv_reads
+    assert parses.count(("read_parquet", True)) == con_reads
+    assert_native_dispatches(
+        native_launches, before, record=True, state_ticks=20, recorder_calls=4,
+    )
+    for table in tables:
+        assert table.schema == SPIKE_SCHEMA
+        assert table["flywire_id"].to_pylist() == [ids[1]] * 4
+        np.testing.assert_array_equal(
+            table["t"].to_numpy(), np.array([1, 1, 3, 3]) * 0.0001,
+        )
+    if change == "rewrite" and source == "comp":
+        assert builds[1].neuron_ids.tolist() == ids[::-1]
+        assert tables[1]["neuron_index"].to_pylist() == [0] * 4
+    else:
+        assert tables[0].equals(tables[1])
+    if change == "rewrite" and source == "con":
+        assert builds[1].contacts.tolist() == [2]
+    if failure:
+        assert "ERROR:" in capsys.readouterr().out
+        if change == "csv_first":
+            assert results[1]["status"] == "error: No columns to parse from file"
+    with benchmark.csv_path.open(newline="") as stored:
+        assert [row["status"] for row in csv.DictReader(stored)] == [results[-1]["status"]]
+    assert results[0]["timings"]["graph_creation"] > 0
+    assert (results[-1]["timings"]["graph_creation"] == 0) == (change != "rewrite")
+
+
+@pytest.mark.parametrize("mode", ["direct", "one_case", "separate_grids"])
+def test_graph_cache_lifetime_and_path_loading(adapter_case, graph_calls, mode):
+    adapter, benchmark, experiment, _ = adapter_case
+    builds, runs, parses = graph_calls
+    for _ in range(2):
+        if mode == "direct":
+            results = [adapter.run_single_benchmark(
+                0.0005, 2, experiment, benchmark.BenchmarkLogger(),
+            )]
+        else:
+            results = adapter.run_all_benchmarks(
+                [0.0005] * (2 if mode == "separate_grids" else 1), [2],
+                experiment, benchmark.BenchmarkLogger(),
+            )
+        assert all(result["status"] == "success" for result in results)
+    assert len(builds) == 2
+    assert len(runs) == (4 if mode == "separate_grids" else 2)
+    assert builds[0] is not builds[1]
+    assert all(snapshot == (mode == "separate_grids") for _, snapshot in parses)
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_empty_grid_and_invalid_scalar_do_not_read_files(
+    adapter_case, monkeypatch, graph_calls, invalid,
+):
+    adapter, benchmark, experiment, _ = adapter_case
+    builds, runs, parses = graph_calls
+    real_import = builtins.__import__
+
+    def checked_import(name, *args, **kwargs):
+        assert invalid or name not in {"numpy", "pandas", "mlx32.engine", "mlx32.model"}
+        return real_import(name, *args, **kwargs)
+
+    def reject_read(*args, **kwargs):
+        raise AssertionError("Unexpected input file access")
+
+    monkeypatch.setattr(builtins, "__import__", checked_import)
+    monkeypatch.setattr(type(adapter.path_comp), "read_bytes", reject_read)
+    results = adapter.run_all_benchmarks(
+        [0.0, 0.0] if invalid else [], [2], experiment, benchmark.BenchmarkLogger(),
+    )
+    assert [result["status"] for result in results] == [
+        "error: t_run_sec must be finite and positive",
+    ] * (2 if invalid else 0)
+    assert not builds and not runs and not parses

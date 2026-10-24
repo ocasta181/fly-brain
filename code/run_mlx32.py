@@ -8,6 +8,8 @@ import os
 import tempfile
 import traceback
 from collections.abc import Mapping, Sequence
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 from time import perf_counter as time
 
@@ -33,6 +35,7 @@ def run_single_benchmark(
     t_run_sec: float, n_run: int, experiment: Mapping, logger: BenchmarkLogger,
     run_idx: int | None = None, total_runs: int | None = None,
     run_label: str | None = None, round_idx: int | None = None,
+    *, _graph_cache: dict | None = None,
 ) -> dict[str, object]:
     """Run all trials once on Metal; optional experiment ``seed`` defaults to 0.
 
@@ -100,18 +103,39 @@ def run_single_benchmark(
                    f'{"enabled" if record_spikes else "disabled"}')
 
         load_start = time()
-        df_comp = pd.read_csv(path_comp, index_col=0)
-        df_con = pd.read_parquet(path_con)
+        comp_source = path_comp
+        if _graph_cache is not None:
+            comp_source = BytesIO(Path(path_comp).read_bytes())
+        df_comp = pd.read_csv(comp_source, index_col=0)
+        con_source = path_con
+        graph = None
+        if _graph_cache is not None:
+            con_source = Path(path_con).read_bytes()
+            cache_key = (
+                sha256(comp_source.getbuffer()).digest(), sha256(con_source).digest(),
+            )
+            graph = _graph_cache.get(cache_key)
+            if graph is None:
+                con_source = BytesIO(con_source)
+        if graph is None:
+            df_con = pd.read_parquet(con_source)
+        del comp_source, con_source
         timings['data_load'] = time() - load_start
-        graph_start = time()
-        graph = make_graph(
-            df_comp.index.to_numpy(copy=True),
-            df_con['Presynaptic_Index'].to_numpy(),
-            df_con['Postsynaptic_Index'].to_numpy(),
-            df_con['Excitatory x Connectivity'].to_numpy(),
-        )
-        timings['graph_creation'] = time() - graph_start
-        del df_comp, df_con
+        timings['graph_creation'] = 0.0
+        if graph is None:
+            graph_start = time()
+            graph = make_graph(
+                df_comp.index.to_numpy(copy=True),
+                df_con['Presynaptic_Index'].to_numpy(),
+                df_con['Postsynaptic_Index'].to_numpy(),
+                df_con['Excitatory x Connectivity'].to_numpy(),
+            )
+            timings['graph_creation'] = time() - graph_start
+            del df_con
+            if _graph_cache is not None:
+                _graph_cache.clear()
+                _graph_cache[cache_key] = graph
+        del df_comp
         mapping_start = time()
         flyid2i = {flyid: i for i, flyid in enumerate(graph.neuron_ids)}
         exc = [flyid2i[flyid] for flyid in experiment['neu_exc']]
@@ -301,6 +325,7 @@ def run_all_benchmarks(
     if logger is None:
         logger = BenchmarkLogger()
     total_runs = len(t_run_values) * len(n_run_values)
+    graph_cache = {} if total_runs > 1 else None
     results = []
     for n_run in n_run_values:
         for t_run_sec in t_run_values:
@@ -308,6 +333,7 @@ def run_all_benchmarks(
                 t_run_sec, n_run, experiment, logger,
                 run_idx=len(results) + 1, total_runs=total_runs,
                 run_label=run_label, round_idx=round_idx,
+                _graph_cache=graph_cache,
             )
             results.append(result)
             save_result_csv(_BACKEND_NAME, result)

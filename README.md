@@ -234,6 +234,10 @@ improving float32 resolution. Returned voltages remain absolute SI volts.
 With the shipped parameters, quiet intervals use an event-anchored linear
 update to reduce repeated float32 rounding.
 
+Multi-case benchmark grids reuse one immutable host graph to reduce repeated
+setup work. Both input files are verified for every case, and the graph is
+rebuilt when either changes.
+
 The existing recording switch, run labels and result columns also apply.
 Recording coalesces ordered batches into bounded 65,536-row Parquet groups;
 `--disable-spike-io`
