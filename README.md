@@ -196,27 +196,36 @@ Recorded warm measurements on an M5 Max with 128 GiB, macOS 26.4 and AC power
 used the complete v783 graph: 138,639 neurons and 15,091,983 edges. Each trial
 simulated one biological second, with spike recording through a closed Parquet file.
 
-| Experiment | Trials | MLX warm seconds | MLX real time |
-|---|---:|---:|---:|
-| Sugar | 1 | 0.193 | 5.17x |
-| P9 | 1 | 0.189 | 5.29x |
-| Sugar | 4 | 0.515 | 7.77x |
-| P9 | 4 | 0.484 | 8.26x |
+| Experiment | Trials | CPU warm seconds | MLX warm seconds | CPU/MLX | MLX real time |
+|---|---:|---:|---:|---:|---:|
+| Sugar | 1 | 1.595 | 0.193 | 8.26x | 5.17x |
+| P9 | 1 | 1.610 | 0.184 | 8.76x | 5.44x |
+| Sugar | 4 | 2.528 | 0.508 | 5.01x | 7.88x |
+| P9 | 4 | 2.331 | 0.491 | 4.73x | 8.14x |
 
-Times are medians of five observations per case, including input generation,
-collection, snapshots and closed output and excluding setup and compilation.
-Four-trial real time denotes aggregate throughput. Five fixed alternating
-pairs per case showed 68–71% higher single-trial throughput and 51–52% higher
-four-trial throughput from temporal blocking. All state and ordered output
-bytes matched; all four simultaneous one-sided 95% lower improvement bounds
-exceeded 46%.
+Times are medians of three fresh alternating CPU/MLX pairs per case. CPU/MLX
+is the geometric mean of paired speedups. Both warm boundaries include input,
+required collection and closed output, and exclude setup/build; MLX includes
+final snapshots. CPU uses Brian float64 C++ standalone for one trial and Eon's
+original runtime/loky route with four prepared Cython simulation tasks for four
+trials. Four-trial real time denotes aggregate throughput. All four simultaneous
+one-sided 95% CPU/MLX lower bounds exceed 4.5x. The input generation paths retain
+their original random streams; matched-input scientific checks are separate.
 
-With matched inputs, a fresh 30-seed whole-graph comparison against Brian
+A separate five-pair comparison showed 68–71% higher single-trial throughput
+and 51–52% higher four-trial throughput from temporal blocking. All state and
+ordered output bytes matched; all four simultaneous one-sided 95% lower
+improvement bounds exceeded 46%. A 32-trial resource check matched all 538,637
+reference spikes and used 0.85 GiB peak GPU allocation with bounded streaming.
+
+With matched inputs, the original 30-seed whole-graph comparison against Brian
 float64 passed all 63 predefined readout intervals for named-neuron firing
 rates, population activity, and activation/silencing contrasts. A separate
 800-neuron screen matched all 79,477 spike events across 32 cases. These checks
 qualify the tested readouts and workloads, rather than universal CPU state or
 spike equality.
+Current independent Brian controls and exact native comparisons support
+retaining that readout qualification after temporal blocking.
 
 Trials share the graph and execute as an independent GPU batch. Inputs are
 reproducible for a fixed seed, trial and round; they do not reproduce Brian's
