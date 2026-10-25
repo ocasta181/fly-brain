@@ -456,6 +456,11 @@ compare raw float64 state and complete ordered spikes with actual Brian C++
 execution. Benchmark setup and compilation are reported separately from warm
 execution, input generation, recording and completed output.
 
+Measured warm CPU speedups range from **1.86× to 4.02×** for full-v783 Sugar/P9
+with one or four trials on an M5 Max running on battery power.
+See the [measurement and verification report](docs/mlx-performance.md) for timings,
+confidence bounds, setup costs and exactness scope.
+
 VF64 and the adapted Kisame runtime mechanics retain their
 [third-party notices](code/mlx_backend/third_party/NOTICE).
 
