@@ -1,6 +1,6 @@
-"""Apple MLX LIF runtime (GPL-2.0-or-later).
+"""Fixed Eon LIF model with native VF64 Metal execution."""
 
-Adapted from PraxisMechanica/fly-brain-mlx, numerical candidate 72627c7.
-Unused qualification/observation code is omitted; numerical operations retain
-that candidate's order and precision. See the root license and fixture README.
-"""
+from .engine import RecordOverflow, RunResult, run_batch
+from .model import Drive, Graph, Model, make_graph
+
+__all__ = ["Drive", "Graph", "Model", "RecordOverflow", "RunResult", "make_graph", "run_batch"]

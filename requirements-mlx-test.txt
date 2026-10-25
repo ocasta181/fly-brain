@@ -1,2 +1,4 @@
 -r requirements-mlx.txt
+brian2==2.8.0
+joblib==1.4.2
 pytest==9.1.1

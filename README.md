@@ -414,61 +414,50 @@ Legacy version 630 data is kept in `data/archive/` for paper figure reproduction
 
 ## Apple MLX backend
 
-The opt-in MLX backend runs Eon simulations on native Apple Metal while
-preserving the existing CPU default. The qualification below describes actual
-measured workloads and named boundary checks; it does not establish every input
-combination accepted by the original model.
+`--mlx` runs the fixed FlyWire v783 Eon LIF model on Apple silicon using
+float64 arithmetic from [VF64-metal](https://github.com/Lulzx/VF64-metal)
+inside native MLX Metal kernels. Physical state retains IEEE binary64 bits;
+there is no CPU simulation fallback.
 
-On Apple silicon macOS, use Python 3.10.14 and the optional MLX environment:
+On Apple silicon macOS, install the Python dependencies with uv, then install
+the pinned external VF64 shader source explicitly:
 
 ```sh
 uv venv --python 3.10.14
 uv pip install -r requirements-mlx.txt
+uv run --no-project python code/mlx_backend/vf64.py --install
 uv run --no-project python main.py --mlx --t_run 0.1 --n_run 1 --run-label mlx_first --no_log_file
 ```
 
-`--mlx` selects native Metal simulation. Existing backends and defaults remain
-unchanged. Use a fresh run label. CLI trials use reproducible PCG64 inputs and
-independent state; repeated rounds receive distinct streams. The backend writes
-CSV results, round manifests, Parquet spikes and `.mlx.json` timing metadata.
-Use `--disable-spike-io` to run without spike collection or export.
+The installer stores VF64 outside this repository. Simulation reads and verifies
+that source without network access. `VF64_SOURCE_DIR` can point to an existing
+checkout at commit `8dae385a16493282e2a3e90e4cd1aa1250b36dc5`.
 
-Default CLI execution uses the configured native Metal engine with binary64
-physical state and the selected Brian CPU arithmetic policy. The historical
-`window` engine selector remains accepted for compatibility; it selects this
-same exact route. Sidecar `engine` records the requested selector.
+The backend supports independent batched trials, activation, outgoing silencing,
+duplicate ordered input channels, configurable fixed LIF parameters, and bounded
+input generation and spike export. CSV results, round manifests and six-column
+Parquet spikes use the common benchmark schemas. Use a fresh run label, and
+`--disable-spike-io` to omit spike recording and export.
 
-Native paths implement custom activation and silencing, duplicate input targets,
-alternate datasets, fractional weights and configurable model expressions.
-Long runs generate inputs in bounded chunks and spool recorded spikes to disk.
-The [original Brian API adapter](docs/mlx-original-api.md) retains Brian objects,
-channel order, RNG state and continuation through an opt-in context manager.
-The source includes Brian built-in equation functions, native paired complex
-temporaries, and real, integer or Boolean persistent state. Native floating
-status drives NumPy error and warning actions; action delivery alone runs on
-the host. Generic user Python callbacks remain outside Eon's contract.
+This fixed-model implementation replaces the earlier general Brian adapter.
+It does not expose arbitrary equations, Brian object lifecycle or schedules,
+complex/integer state, NumPy error policies, or the original Brian RNG stream.
+PCG64 inputs are reproducible by seed, round and trial. Exact CPU comparisons
+use identical input tapes and the documented Brian2 2.8.0 C++ arithmetic policy;
+independently generated CPU and GPU inputs are different streams.
 
-### Qualification scope
+The numerical reference is Brian C++ standalone on Apple arm64 with Clang 21,
+`-O3 -ffast-math -fno-finite-math-only -march=native`. The kernels preserve
+its FMA rounding, ordered per-edge additions, and binary64 refractory decisions.
 
-The [maintainer review note](docs/mlx-review.md) records measured sources,
-comparison methods, named boundary checks and the clean-checkout command.
+Install `requirements-mlx-test.txt` to run the focused regression suite with
+`python -m pytest`. Metal tests require an Apple silicon GPU. Shared-input tests
+compare raw float64 state and complete ordered spikes with actual Brian C++
+execution. Benchmark setup and compilation are reported separately from warm
+execution, input generation, recording and completed output.
 
-| Evidence | Observed result and scope |
-|---|---|
-| Matched performance | All 16 representative cases meet the 2× median floor: 2.029962–7.279297× versus Brian Cython runtime workers. One exceeds the 5× target; 15 meet the accepted 2–5× band. These desktop-qualified results are separate from C++ CLI timing. |
-| Native workflows | 28 observations, 27 recorded cells and 54 exports include standard/default/paper/resumed execution and largest 1000s/32-trial recording on/off equality. Two default and 76 paper cross-product cells remain unrun. |
-| Independent-input P9 | Passes at 9216 trials per arm with fixed margins and Brian controls. The scientific runtime remains `5feffb5dcd32`; later applicability comes from scoped source review. |
-| Boundary regressions | Named exact CPU/Metal checks cover complex/cast/NumPy-action behavior, recording, arithmetic, IEEE parameters/delays, empty and signed clocks, optional reset, failure prefixes and continuation. Coverage and comparison rules are detailed in the review note. |
-
-Campaign receipts, failed witnesses, output datasets and execution archives stay
-in the separate private evidence pack.
-
-Install `requirements-mlx-test.txt` for CPU-reference and regression checks.
-`python -m pytest -m 'not metal'` selects host checks;
-`python -m pytest -m metal` requires Apple silicon and a working Metal device.
-The [replay fixtures](tests/data/mlx-replay/README.md) contain independent Brian2
-inputs and expected spikes. Shared-input replay and the independent-input P9
-study answer different correctness questions.
+VF64 and the adapted Kisame runtime mechanics retain their
+[third-party notices](code/mlx_backend/third_party/NOTICE).
 
 ## License
 

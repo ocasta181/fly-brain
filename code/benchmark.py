@@ -14,6 +14,8 @@ Entrypoint is in main.py at the project root.
 
 import os
 import csv
+import shutil
+import tempfile
 import warnings
 warnings.filterwarnings('ignore', category=UserWarning)
 
@@ -21,6 +23,7 @@ os.environ['PYTHONUNBUFFERED'] = '1'
 
 from pathlib import Path
 from datetime import datetime
+from contextlib import ExitStack
 
 # ============================================================================
 # Benchmark Configuration
@@ -216,7 +219,7 @@ def _csv_key(row):
         str(row.get('n_run', '')),
         str(row.get('t_run', '')),
     )
-    if row.get('run_label') or row.get('round'):
+    if row.get('run_label') or row.get('round') not in ('', None):
         return base + (
             row.get('experiment_key', ''),
             row.get('run_label', ''),
@@ -225,8 +228,8 @@ def _csv_key(row):
     return base
 
 
-def _save_manifest_csv(result, row):
-    """Write/update a compact manifest for round-specific spike outputs."""
+def _manifest_csv(row):
+    """Prepare a compact manifest for round-specific spike outputs."""
     run_label = row.get('run_label', '')
     if not run_label or not row.get('spike_path'):
         return
@@ -283,10 +286,48 @@ def _save_manifest_csv(result, row):
     if not updated:
         existing_rows.append(manifest_row)
 
-    with open(manifest_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS)
-        writer.writeheader()
-        writer.writerows(existing_rows)
+    return manifest_path, MANIFEST_COLUMNS, existing_rows
+
+
+class MetadataRollbackError(OSError):
+    """Publication failed and prior metadata could not be restored."""
+
+
+def _publish_csvs(outputs):
+    """Stage closed files and restore prior metadata if publication fails."""
+    with ExitStack() as stack:
+        staged = []
+        for path, columns, rows in outputs:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            directory = Path(stack.enter_context(tempfile.TemporaryDirectory(
+                prefix=f'.{path.name}.', dir=path.parent, ignore_cleanup_errors=True,
+            )))
+            temporary, previous = directory / 'new', directory / 'previous'
+            if path.exists():
+                shutil.copy2(path, previous)
+            with open(temporary, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=columns)
+                writer.writeheader()
+                writer.writerows(rows)
+            staged.append((path, temporary, previous))
+
+        published = []
+        try:
+            for path, temporary, previous in staged:
+                os.replace(temporary, path)
+                published.append((path, previous))
+        except Exception as error:
+            try:
+                for path, previous in reversed(published):
+                    if previous.exists():
+                        os.replace(previous, path)
+                    else:
+                        path.unlink()
+            except OSError as rollback_error:
+                raise MetadataRollbackError(
+                    f'{error}; metadata rollback failed: {rollback_error}'
+                ) from rollback_error
+            raise
 
 
 def save_result_csv(backend_name, result):
@@ -342,12 +383,11 @@ def save_result_csv(backend_name, result):
     if not updated:
         existing_rows.append({k: str(v) for k, v in row.items()})
 
-    with open(csv_path, 'w', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(existing_rows)
-
-    _save_manifest_csv(result, row)
+    outputs = [(csv_path, CSV_COLUMNS, existing_rows)]
+    manifest = _manifest_csv(row)
+    if manifest is not None:
+        outputs.append(manifest)
+    _publish_csvs(outputs)
 
 
 # ============================================================================
@@ -408,7 +448,7 @@ BACKEND_NAMES = {
     'nestgpu': 'NEST GPU',
     'genn': 'GeNN (GPU)',
     'brian2genn': 'Brian2GeNN (GPU)',
-    'mlx': 'MLX (Apple GPU)',
+    'mlx': 'MLX float64 (VF64 Metal)',
 }
 
 
@@ -484,7 +524,7 @@ def run_benchmarks(backends, t_run_values=None, n_run_values=None,
                 all_results.setdefault(backend, []).extend(results)
 
             elif backend == 'mlx':
-                from run_mlx import run_all_benchmarks as run_mlx
+                from run_mlx import run_benchmarks as run_mlx
                 results = run_mlx(
                     t_run_values=t_run_values,
                     n_run_values=n_run_values,

@@ -1,4 +1,0 @@
-Poisson sampling and log-gamma operation order in expression_poisson.py are
-adapted from NumPy v1.26.4 numpy/random/src/distributions/distributions.c.
-Copyright (c) 2005-2023, NumPy Developers. BSD-3-Clause; see NumPy-LICENSE.
-Source: https://github.com/numpy/numpy/blob/v1.26.4/numpy/random/src/distributions/distributions.c

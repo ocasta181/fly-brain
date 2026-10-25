@@ -1,18 +1,27 @@
-"""Eon benchmark entry points for the optional Apple MLX backend.
+"""Optional batched binary64 Metal runner for the fixed Eon model.
 
 GPL-2.0-or-later. See mlx_backend and the independent regression fixtures.
 """
 
-import importlib.metadata
-import json
+from __future__ import annotations
+
+import math
+import operator
+import os
+import tempfile
+import traceback
+from collections.abc import Mapping, Sequence
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
-from time import perf_counter
+from time import perf_counter as time
 
 from benchmark import (
     BACKEND_NAMES,
     N_RUN_VALUES,
     T_RUN_VALUES_SEC,
     BenchmarkLogger,
+    MetadataRollbackError,
     get_experiment,
     get_spike_output_path,
     path_comp,
@@ -22,300 +31,347 @@ from benchmark import (
     spike_io_enabled,
 )
 
-
-def spike_table(connectome, runs, exp_name):
-    import numpy as np
-    import pyarrow as pa
-    from mlx_backend.export import _unmapped_identifier_rows
-
-    trial = np.concatenate([run.spikes.trials for run in runs])
-    neurons = np.concatenate([run.spikes.neurons for run in runs])
-    steps = np.concatenate([run.spikes.steps for run in runs])
-    unmapped = _unmapped_identifier_rows(connectome.neuron_ids)
-    if unmapped is not None:
-        missing = np.flatnonzero(unmapped[neurons])
-        if missing.size:
-            first = missing[np.lexsort((neurons[missing], trial[missing]))[0]]
-            raise KeyError(int(neurons[first]))
-    order = np.lexsort((neurons, steps, trial))
-    seconds = np.concatenate([
-        run.spikes.steps.astype(np.float64) * getattr(run, "dt_s", 0.0001)
-        for run in runs
-    ])[order]
-    identifiers = pa.array(connectome.neuron_ids[neurons[order]])
-    schema = pa.schema(
-        [
-            ("t", pa.float64()),
-            ("time_ms", pa.float64()),
-            ("trial", pa.int64()),
-            ("neuron_index", pa.int64()),
-            ("flywire_id", pa.array(connectome.neuron_ids).type),
-            ("exp_name", pa.string()),
-        ]
-    )
-    return pa.table(
-        {
-            "t": seconds,
-            "time_ms": seconds * 1000,
-            "trial": trial[order],
-            "neuron_index": neurons[order],
-            "flywire_id": identifiers,
-            "exp_name": [exp_name] * len(seconds),
-        },
-        schema=schema,
-    )
+_BACKEND_NAME = BACKEND_NAMES['mlx']
+_CHUNK_SIZE = 32
+_ARROW_ROWS = 65_536
 
 
 def run_single_benchmark(
-    t_run_sec,
-    n_run,
-    experiment,
-    logger,
-    run_idx=None,
-    total_runs=None,
-    run_label=None,
-    round_idx=None,
-    *,
-    seed=20261004,
-    stimulus_path=None,
-    engine="window",
-    strategy="batch",
-    stream_output=None,
-):
-    """Run independent trials with the selected internal execution strategy.
+    t_run_sec: float, n_run: int, experiment: Mapping, logger: BenchmarkLogger,
+    run_idx: int | None = None, total_runs: int | None = None,
+    run_label: str | None = None, round_idx: int | None = None,
+    *, _graph_cache: dict | None = None,
+) -> dict[str, object]:
+    """Run fresh trials on Metal; optional experiment ``seed`` defaults to 0.
 
-    Saved input is the retained stimulus.json/stimulus.npz directory. Shorter
-    horizons and trial counts select verified prefixes of that archive.
+    Simulation time covers synchronized device execution and spike extraction.
+    Input staging, host collection and export have separate timers. Native
+    ``runtime_s`` includes streamed collection/export; the final Parquet flush
+    and close appear only in the result timers.
     """
-    import mlx_engine
+    started = time()
+    timings = {}
+    result = {
+        't_run_sec': t_run_sec,
+        'n_run': n_run,
+        'n_active_neurons': 0,
+        'n_spikes': 0,
+        'backend_key': 'mlx',
+        'experiment_name': experiment['name'],
+        'experiment_key': experiment['key'],
+        'run_label': run_label or '',
+        'round': '' if round_idx is None else round_idx,
+        'spike_path': '',
+        'timings': timings,
+    }
+    writer = None
+    temporary_path = None
+    published_path = None
+    sink_collection_s = 0.0
+    sink_export_s = 0.0
+    rows_written = 0
 
-    started = perf_counter()
-    record = spike_io_enabled()
-    steps = mlx_engine.dimensions(t_run_sec, n_run)
-    mlx_engine.configure()
-    exp_name = f"mlx_t{t_run_sec}s_n{n_run}"
-    path = get_spike_output_path(exp_name, run_label, round_idx) if record else None
-    sidecar = path.with_suffix(".mlx.json") if record else None
-    if record and (path.exists() or sidecar.exists()):
-        raise FileExistsError(
-            f"MLX output already exists; choose a fresh run label: {path}"
-        )
-
-    import numpy as np
-
-    effective_seed = seed
-    if stimulus_path is None and round_idx is not None and round_idx > 1:
-        if type(seed) is not int or seed < 0:
-            raise ValueError("MLX seed must be a nonnegative integer")
-        effective_seed = int(
-            np.random.SeedSequence([seed, round_idx]).generate_state(
-                1, dtype=np.uint64
-            )[0]
-        )
-
-    spec = mlx_engine.experiment_spec(experiment)
-    connectome = mlx_engine.load_inputs(path_comp, path_con)
-    inputs, silenced = mlx_engine.stimuli(
-        connectome, spec, steps, n_run, effective_seed, stimulus_path
-    )
-    if strategy not in {"batch", "sequential"}:
-        raise ValueError("Unknown MLX trial strategy")
-    batched = engine == "window" and strategy == "batch" and n_run > 1
-    workloads = [mlx_engine.combine_trials(inputs)] if batched else inputs
-    if stream_output is not None and type(stream_output) is not bool:
-        raise TypeError("stream_output must be a boolean or None")
-    spooled = record and (
-        stream_output if stream_output is not None
-        else any(hasattr(stimulus.events, "chunk") for stimulus in workloads)
-    )
-    spool = None
-    if spooled:
-        from mlx_backend.export import SpoolSpikes
-
-        spool = SpoolSpikes(connectome, (trial for item in inputs for trial in item.trial_indices), exp_name)
-    setup = perf_counter() - started
-    simulation = 0.0
-    jit = 0.0
-    postprocessing = 0.0
-    runs = []
-    collection = save_time = 0.0
-    n_spikes = n_active = 0
     try:
-        for index, stimulus in enumerate(workloads):
-            logger.log(
-                f"MLX {exp_name}: {'batch' if batched else 'fresh trial'} {index + 1}/{len(workloads)}"
+        dependency_start = time()
+        import numpy as np
+        import pandas as pd
+
+        from mlx_backend.engine import run_batch
+        from mlx_backend.model import Drive, Model, make_graph
+
+        timings['dependency_setup'] = time() - dependency_start
+        model = Model()
+        if isinstance(n_run, (bool, np.bool_)):
+            raise ValueError('n_run must be a positive integer')
+        n_run = operator.index(n_run)
+        if not 0 < n_run <= 2**31 - 1:
+            raise ValueError('n_run must be a positive int32 integer')
+        if isinstance(t_run_sec, (bool, np.bool_)):
+            raise ValueError('t_run_sec must be finite and positive')
+        duration = float(t_run_sec)
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError('t_run_sec must be finite and positive')
+        ticks = duration / model.dt_s
+        if not math.isfinite(ticks):
+            raise ValueError('t_run_sec exceeds the supported tick range')
+        steps = round(ticks)
+        if not 0 < steps <= 2**31 - 1 or not math.isclose(
+            ticks, steps, rel_tol=0.0, abs_tol=4 * math.ulp(ticks)
+        ):
+            raise ValueError('t_run_sec must be an integral number of dt ticks')
+        seed_round = 0 if round_idx is None else round_idx
+        exp_name = f'mlx_t{t_run_sec}s_n{n_run}'
+        record_spikes = spike_io_enabled()
+        run_info = f'[{run_idx}/{total_runs}] ' if run_idx else ''
+        logger.log(f'{run_info}BENCHMARK: {_BACKEND_NAME}, '
+                   f't_run={t_run_sec}s, n_run={n_run}')
+        logger.log(f'Spike probing/output: '
+                   f'{"enabled" if record_spikes else "disabled"}')
+
+        load_start = time()
+        comp_source = path_comp
+        if _graph_cache is not None:
+            comp_source = BytesIO(Path(path_comp).read_bytes())
+        df_comp = pd.read_csv(comp_source, index_col=0)
+        con_source = path_con
+        graph = None
+        if _graph_cache is not None:
+            con_source = Path(path_con).read_bytes()
+            cache_key = (
+                sha256(comp_source.getbuffer()).digest(), sha256(con_source).digest(),
             )
-            execution_options = dict(engine=engine, record=record)
-            if spool is not None:
-                execution_options["spike_sink"] = spool
-            run_started = perf_counter()
-            result = mlx_engine.execute(connectome, stimulus, silenced, **execution_options)
-            engine_elapsed = perf_counter() - run_started
-            setup += result.timings["setup_s"]
-            preparation = result.timings.get("jit_and_warmup_s", 0.0)
-            export_io = result.timings.get("spike_spool_io_s", 0.0)
-            jit += preparation
-            simulation += result.timings["simulation_wall_s"]
-            save_time += export_io
-            postprocessing += max(
-                0.0,
-                engine_elapsed - result.timings["setup_s"] - preparation
-                - result.timings["simulation_wall_s"] - export_io,
+            graph = _graph_cache.get(cache_key)
+            if graph is None:
+                con_source = BytesIO(con_source)
+        if graph is None:
+            df_con = pd.read_parquet(con_source, columns=[
+                'Presynaptic_Index', 'Postsynaptic_Index',
+                'Excitatory x Connectivity',
+            ])
+        del comp_source, con_source
+        timings['data_load'] = time() - load_start
+        timings['graph_creation'] = 0.0
+        if graph is None:
+            graph_start = time()
+            graph = make_graph(
+                df_comp.index.to_numpy(copy=True),
+                df_con['Presynaptic_Index'].to_numpy(),
+                df_con['Postsynaptic_Index'].to_numpy(),
+                df_con['Excitatory x Connectivity'].to_numpy(),
             )
-            runs.append(result)
-        if spool is not None:
-            exported = spool.finish(path)
-            collection = postprocessing + exported["collection_s"]
-            save_time += exported["save_s"]
-            n_spikes, n_active = spool.n_spikes, spool.n_active_neurons
-        elif record:
+            timings['graph_creation'] = time() - graph_start
+            del df_con
+            if _graph_cache is not None:
+                _graph_cache.clear()
+                _graph_cache[cache_key] = graph
+        del df_comp
+        mapping_start = time()
+        flyid2i = {flyid: i for i, flyid in enumerate(graph.neuron_ids)}
+        exc = [flyid2i[flyid] for flyid in experiment['neu_exc']]
+        exc2 = [flyid2i[flyid] for flyid in experiment['neu_exc2']]
+        silenced = [flyid2i[flyid] for flyid in experiment['neu_slnc']]
+        drive = Drive(
+            np.array(exc + exc2, dtype=np.int32),
+            np.array([experiment['stim_rate']] * len(exc) + [0.0] * len(exc2)),
+            seed=experiment.get('seed', 0),
+        )
+        logger.log(f'Seed: {drive.seed}; round: {seed_round}')
+        timings['id_mapping'] = time() - mapping_start
+        timings['adapter_setup'] = time() - started
+
+        output_setup_start = time()
+        if record_spikes:
+            import pyarrow as pa
             import pyarrow.parquet as pq
 
-            collecting = perf_counter()
-            table = spike_table(connectome, runs, exp_name)
-            collection = postprocessing + perf_counter() - collecting
-            n_spikes = table.num_rows
-            n_active = int(np.unique(table["flywire_id"].to_numpy()).size)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            saving = perf_counter()
-            with path.open("xb") as destination:
-                pq.write_table(table, destination, compression="brotli")
-            save_time += perf_counter() - saving
+            schema = pa.schema([
+                ('t', pa.float64()), ('time_ms', pa.float64()),
+                ('trial', pa.int64()), ('neuron_index', pa.int64()),
+                ('flywire_id', pa.int64()), ('exp_name', pa.string()),
+            ])
+            path_save = get_spike_output_path(exp_name, run_label, round_idx)
+            if path_save.exists():
+                raise FileExistsError(f'MLX output already exists: {path_save}')
+            path_save.parent.mkdir(parents=True, exist_ok=True)
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=f'.{exp_name}.', suffix='.parquet.tmp', dir=path_save.parent,
+            )
+            temporary_path = Path(temporary_name)
+            os.close(fd)
+            writer = pq.ParquetWriter(temporary_path, schema, compression='brotli')
+            event_buffer = np.empty((_ARROW_ROWS, 3), dtype=np.int64)
+            buffered_rows = 0
+
+        timings['output_setup'] = time() - output_setup_start
+
+        def flush_spikes() -> None:
+            nonlocal buffered_rows, rows_written, sink_collection_s, sink_export_s
+            if not buffered_rows:
+                return
+            batch = event_buffer[:buffered_rows]
+            collection_start = time()
+            try:
+                seconds = batch[:, 0].astype(np.float64) * model.dt_s
+                table = pa.Table.from_arrays([
+                    pa.array(seconds), pa.array(seconds * 1000.0),
+                    pa.array(batch[:, 1]), pa.array(batch[:, 2]),
+                    pa.array(graph.neuron_ids[batch[:, 2]]),
+                    pa.array([exp_name] * len(batch), type=pa.string()),
+                ], schema=schema)
+            finally:
+                sink_collection_s += time() - collection_start
+            export_start = time()
+            try:
+                writer.write_table(table, row_group_size=_ARROW_ROWS)
+            finally:
+                sink_export_s += time() - export_start
+            rows_written += buffered_rows
+            buffered_rows = 0
+
+        def write_spikes(events: np.ndarray) -> None:
+            nonlocal buffered_rows, sink_collection_s
+            offset = 0
+            while offset < len(events):
+                collection_start = time()
+                try:
+                    length = min(_ARROW_ROWS - buffered_rows, len(events) - offset)
+                    event_buffer[buffered_rows:buffered_rows + length] = (
+                        events[offset:offset + length]
+                    )
+                    buffered_rows += length
+                    offset += length
+                finally:
+                    sink_collection_s += time() - collection_start
+                if buffered_rows == _ARROW_ROWS:
+                    flush_spikes()
+
+        run_start = time()
+        try:
+            native = run_batch(
+                graph, steps, drive, trials=tuple(range(n_run)), model=model,
+                chunk_size=_CHUNK_SIZE, record=record_spikes,
+                round_idx=seed_round, silenced=silenced,
+                spike_sink=write_spikes if record_spikes else None,
+                max_recorded_events=1_000_000,
+            )
+        finally:
+            timings['native_call'] = time() - run_start
+        timings.update(native.timings)
+        timings['network_creation_total'] = (
+            timings['adapter_setup'] + native.timings['setup_compile_s']
+            - native.timings['compile_warmup_s']
+        )
+        timings['device_build'] = native.timings['compile_warmup_s']
+        timings['simulation_total'] = native.timings['simulation_s']
+        timings['simulation_avg_per_trial'] = timings['simulation_total'] / n_run
+        timings['sink_in_native'] = sink_collection_s + sink_export_s
+        timings['spike_extraction_total'] = max(
+            0.0, native.timings['collection_s'] - timings['sink_in_native'],
+        )
+        if record_spikes:
+            flush_spikes()
+
+        summary_start = time()
+        n_spikes = int(np.sum(native.counts, dtype=np.int64))
+        if record_spikes and rows_written != n_spikes:
+            raise RuntimeError('streamed spike count differs from native counts')
+        result['n_spikes'] = n_spikes
+        result['n_active_neurons'] = int(
+            np.count_nonzero(np.any(native.counts != 0, axis=0))
+        )
+        timings['result_collection'] = (
+            sink_collection_s + native.timings['snapshots_s'] + time() - summary_start
+        )
+
+        publish_start = time()
+        if writer is not None:
+            writer.close()
+            writer = None
+            os.link(temporary_path, path_save)
+            published_path = path_save
+            temporary_path.unlink()
+            temporary_path = None
+            result['spike_path'] = str(path_save)
+        timings['result_save'] = (
+            timings['output_setup'] + sink_export_s + time() - publish_start
+        )
+        timings['total_elapsed'] = time() - started
+        simulated_time = duration * n_run
+        timings['realtime_ratio'] = (
+            simulated_time / timings['simulation_total']
+            if timings['simulation_total'] > 0 else float('inf')
+        )
+        timings['realtime_ratio_total'] = simulated_time / timings['total_elapsed']
+        timings['phase_total'] = sum(timings[key] for key in (
+            'network_creation_total', 'device_build', 'input_generation_staging_s',
+            'simulation_total', 'spike_extraction_total',
+            'result_collection', 'result_save',
+        ))
+        result['status'] = 'success'
+        logger.log(f'Simulation: {timings["simulation_total"]:.3f}s; '
+                   f'total: {timings["total_elapsed"]:.3f}s; '
+                   f'spikes: {result["n_spikes"]}')
+        if result['spike_path']:
+            logger.log(f'Output file: {result["spike_path"]}')
+    except Exception as error:
+        timings['total_elapsed'] = time() - started
+        result.update(status=f'error: {error}', n_spikes=0,
+                      n_active_neurons=0, spike_path='')
+        logger.log(f'ERROR: {error}')
+        logger.log_raw(traceback.format_exc())
     finally:
-        if spool is not None:
-            cleaning = perf_counter()
-            spool.close()
-            save_time += perf_counter() - cleaning
-    spike_digest = None
-    if record:
-        from mlx_backend.inputs import file_sha256
+        timings['sink_collection'] = sink_collection_s
+        timings['sink_export'] = sink_export_s
+        try:
+            if writer is not None:
+                writer.close()
+        except Exception as error:
+            result.update(status=f'error: parquet close failed: {error}',
+                          n_spikes=0, n_active_neurons=0, spike_path='')
+            logger.log(f'ERROR: parquet close failed: {error}')
+        finally:
+            cleanup_paths = [temporary_path]
+            if result.get('status') != 'success':
+                cleanup_paths.append(published_path)
+            for cleanup_path in cleanup_paths:
+                try:
+                    if cleanup_path is not None:
+                        cleanup_path.unlink(missing_ok=True)
+                except OSError as error:
+                    result.update(status=f'error: output cleanup failed: {error}',
+                                  n_spikes=0, n_active_neurons=0, spike_path='')
+                    logger.log(f'ERROR: output cleanup failed: {error}')
+        if result.get('status') != 'success':
+            timings['total_elapsed'] = time() - started
 
-        hashing = perf_counter()
-        spike_digest = file_sha256(path)
-        save_time += perf_counter() - hashing
-    elapsed = perf_counter() - started
-    timings = {
-        "network_creation_total": setup,
-        "device_build": jit,
-        "simulation_total": simulation,
-        "simulation_avg_per_trial": simulation / n_run,
-        "result_collection": collection,
-        "result_save": save_time,
-        "total_elapsed": elapsed,
-        "realtime_ratio": t_run_sec * n_run / simulation,
-        "realtime_ratio_total": t_run_sec * n_run / elapsed,
-    }
-    result = {
-        "t_run_sec": t_run_sec,
-        "n_run": n_run,
-        "n_spikes": n_spikes,
-        "n_active_neurons": n_active,
-        "status": "success",
-        "timings": timings,
-        "backend_key": "mlx",
-        "experiment_name": experiment["name"],
-        "experiment_key": experiment["key"],
-        "run_label": run_label or "",
-        "round": round_idx or "",
-        "spike_path": str(path) if record else "",
-    }
-    if not record:
-        logger.log("MLX spike probing/output disabled; no Parquet written")
-        return result
-
-    import resource
-
-    pin = connectome.pin or mlx_engine.input_pin()
-    consumed_hashes = [digest for run in runs for digest in (run.input_sha256 or ())]
-    event_hashes = consumed_hashes if len(consumed_hashes) == n_run else [x.sha256 for x in inputs]
-    if any(digest is None for digest in event_hashes):
-        raise RuntimeError("Streamed events were not fully fingerprinted during execution")
-    metadata = {
-        "result": result,
-        "execution_mode": "batched-fresh-trials"
-        if batched
-        else "sequential-fresh-singletons",
-        "engine": engine,
-        "device": runs[0].device_name,
-        "dt_ms": 0.1,
-        "seed": inputs[0].seed,
-        "base_seed": seed,
-        "effective_seed": inputs[0].seed,
-        "round": round_idx,
-        "record_spikes": record,
-        "output_mode": "bounded-spool" if spooled else "retained",
-        "generator": "PCG64",
-        "seed_tuples": [[x.seed, x.generator_code, x.trial_indices[0]] for x in inputs],
-        "canonical_event_sha256": event_hashes,
-        "stimulus_source": str(Path(stimulus_path).resolve())
-        if stimulus_path
-        else "canonical-generation",
-        "activated_ids": list(spec.activated_ids),
-        "activation_classes": list(spec.activation_classes),
-        "rates_hz": list(spec.rates_hz),
-        "silenced_ids": list(spec.silenced_ids),
-        "input_sha256": {
-            "completeness": pin.completeness_sha256,
-            "connectivity": pin.connectivity_sha256,
-        },
-        "spike_sha256": spike_digest,
-        "mlx_peak_allocation_bytes": max(x.peak_device_bytes for x in runs),
-        "process_peak_rss_bytes": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-        "per_trial_timings": [
-            {key: value / n_run for key, value in runs[0].timings.items()}
-            for _ in inputs
-        ]
-        if batched
-        else [x.timings for x in runs],
-        "per_trial_timing_scope": "amortized batch timing"
-        if batched
-        else "independent trial timing",
-        "engine_timings": [x.timings for x in runs],
-        "versions": {
-            name: importlib.metadata.version(name)
-            for name in ("mlx", "mlx-metal", "numpy", "pyarrow")
-        },
-        "MLX_ENABLE_TF32": "0",
-        "compilation": "custom-metal-jit" if engine == "window" else "disabled",
-        "timing_scope": "Whole-loop simulation includes input staging/fingerprinting, dispatch, synchronization and block collection; scratch export I/O is charged to result_save. Window-engine JIT preparation uses disposable state and is separate. Final Arrow preparation, Parquet export and file hashing are outside simulation; total ends after export cleanup, before JSON sidecar/logging.",
-        "memory_scope": "Process ru_maxrss and MLX allocator peaks are distinct, non-additive scopes; neither establishes physical unified-memory usage.",
-        "validation_scope": "Replay parity and independent-cohort agreement are separate claims. This record describes the selected engine, workload and seed; independent-cohort P9 equivalence remains unestablished.",
-    }
-    with sidecar.open("x") as destination:
-        json.dump(metadata, destination, indent=2, allow_nan=False)
-        destination.write("\n")
-    logger.log(f"MLX wrote {n_spikes} spikes to {path}")
     return result
 
 
-def run_all_benchmarks(
-    t_run_values=None,
-    n_run_values=None,
-    experiment=None,
-    logger=None,
-    run_label=None,
-    round_idx=None,
-):
-    if logger is None:
-        logger = BenchmarkLogger()
+def run_benchmarks(
+    t_run_values: Sequence[float] | None = None,
+    n_run_values: Sequence[int] | None = None,
+    experiment: Mapping | None = None, logger: BenchmarkLogger | None = None,
+    run_label: str | None = None, round_idx: int | None = None,
+) -> list[dict[str, object]]:
+    """Run the existing parameter grid through the optional Metal backend."""
+    if t_run_values is None:
+        t_run_values = T_RUN_VALUES_SEC
+    if n_run_values is None:
+        n_run_values = N_RUN_VALUES
     if experiment is None:
         experiment = get_experiment()
-    times = T_RUN_VALUES_SEC if t_run_values is None else t_run_values
-    counts = N_RUN_VALUES if n_run_values is None else n_run_values
-    parameters = [(duration, count) for count in counts for duration in times]
+    if logger is None:
+        logger = BenchmarkLogger()
+    total_runs = len(t_run_values) * len(n_run_values)
+    graph_cache = {} if total_runs > 1 else None
     results = []
-    for index, (duration, count) in enumerate(parameters, 1):
-        result = run_single_benchmark(
-            duration,
-            count,
-            experiment,
-            logger,
-            index,
-            len(parameters),
-            run_label,
-            round_idx,
-        )
-        save_result_csv(BACKEND_NAMES["mlx"], result)
-        results.append(result)
-    print_summary_table(results, BACKEND_NAMES["mlx"], logger)
+    for n_run in n_run_values:
+        for t_run_sec in t_run_values:
+            result = run_single_benchmark(
+                t_run_sec, n_run, experiment, logger,
+                run_idx=len(results) + 1, total_runs=total_runs,
+                run_label=run_label, round_idx=round_idx,
+                _graph_cache=graph_cache,
+            )
+            results.append(result)
+            try:
+                save_result_csv(_BACKEND_NAME, result)
+            except Exception as error:
+                rollback_failed = isinstance(error, MetadataRollbackError)
+                owned_path = (result.get('spike_path')
+                              if result['status'] == 'success' and not rollback_failed
+                              else None)
+                status = f'error: result metadata save failed: {error}'
+                if result['status'] != 'success':
+                    status = f'{result["status"]}; result metadata save failed: {error}'
+                if owned_path:
+                    try:
+                        Path(owned_path).unlink(missing_ok=True)
+                    except OSError as cleanup_error:
+                        status += f'; output cleanup failed: {cleanup_error}'
+                result.update(status=status, n_spikes=0, n_active_neurons=0,
+                              spike_path=result['spike_path'] if rollback_failed else '')
+                logger.log(f'ERROR: {status}')
+                logger.log_raw(traceback.format_exc())
+    print_summary_table(results, _BACKEND_NAME, logger)
     return results

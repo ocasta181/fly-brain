@@ -56,7 +56,7 @@ BACKEND_OPTIONS = (
     ('nestgpu', 'nestgpu', 'Run NEST GPU benchmark'),
     ('genn', 'genn', 'Run GeNN benchmark'),
     ('brian2genn', 'brian2genn', 'Run Brian2GeNN benchmark'),
-    ('mlx', 'mlx', 'Run Apple MLX with independent batched trials'),
+    ('mlx', 'mlx', 'Run float64 Eon LIF on Apple Metal with VF64'),
 )
 
 

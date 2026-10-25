@@ -1,0 +1,12 @@
+The fixed LIF runtime adapts GPU propagation, recording and bounded export
+mechanics from Kisame76/drosophila-brain-mlx, revision
+e417b33616513ef350b1b1c3cdf2b5b7a1799c8e, through the independent float32
+Eon implementation. Copyright (c) 2026 Kiyan Doguc. See Kisame76-LICENSE.
+
+Binary64 arithmetic uses the externally installed, unchanged VF64-metal shader
+from https://github.com/Lulzx/VF64-metal at revision
+8dae385a16493282e2a3e90e4cd1aa1250b36dc5. The shader is not vendored here.
+Copyright and BSD-3-Clause terms are preserved in VF64-LICENSE and in the
+installed dependency cache.
+
+The Eon project retains its GPL-2.0-or-later license.
