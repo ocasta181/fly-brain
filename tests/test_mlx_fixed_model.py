@@ -346,13 +346,14 @@ def test_generated_input_uses_seed_round_trial_and_chunk_independent_identity(me
 def test_empty_zero_step_and_no_input_shapes_need_no_device():
     from mlx_backend.engine import run_batch
 
-    for neurons, steps in ((0, 5), (1, 0)):
+    for neurons, steps, delay in ((0, 5, 18), (1, 0, 18), (0, 5, 2**31 - 1)):
         graph = make_graph(np.arange(neurons, dtype=np.int64), [], [], [])
-        result = run_batch(graph, steps, Drive([], []), trials=(3, 7), trace=True)
+        result = run_batch(graph, steps, Drive([], []), trials=(3, 7), trace=True,
+                           model=Model(delay_steps=delay))
         assert result.step == steps
         assert result.v.shape == result.g.shape == result.lastspike.shape == (2, neurons)
         assert result.counts.shape == (2, neurons)
-        assert result.delay_ring.shape == (18, 2, neurons)
+        assert result.delay_ring.shape == (delay, 2, neurons)
         assert result.spikes.shape == (0, 3)
         assert result.v_trace.shape == result.g_trace.shape == (steps, 2, neurons)
         assert result.eligible_trace.shape == (steps, 2, neurons)
@@ -440,3 +441,28 @@ def test_dense_event_extraction_is_bounded_sorted_and_complete(metal, monkeypatc
     assert_exact(np.concatenate(chunks), baseline.spikes)
     for name in STATE_FIELDS:
         assert_exact(getattr(streamed, name), getattr(baseline, name))
+
+
+@pytest.mark.parametrize("delay", [1, 7, 18, 31, 32, 33, 65])
+def test_delayed_events_and_physical_ring_across_word_and_queue_boundaries(metal, delay):
+    graph = make_graph([1, 2], [0], [1], [10000])
+    drive = Drive([0], [100])
+    model = Model(delay_steps=delay)
+    steps = 4 * delay + 9
+    tape = np.zeros((steps, 2, 1), dtype=np.uint8)
+    tape[::7, 0, 0] = 1
+    tape[::11, 1, 0] = 1
+    options = dict(model=model, trials=(3, 7), input_tape=tape)
+    baseline = metal(graph, steps, drive, chunk_size=1, trace=True, **options)
+    for trial in range(2):
+        assert baseline.spikes[(baseline.spikes[:, 1] == trial)
+                               & (baseline.spikes[:, 2] == 1), 0][0] == delay + 2
+    expected_ring = np.zeros((delay, 2, 2), dtype=np.uint8)
+    for tick, trial, neuron in baseline.spikes:
+        if tick >= steps - delay:
+            expected_ring[tick % delay, trial, neuron] = 1
+    assert_exact(baseline.delay_ring, expected_ring)
+    for chunk in (3, 32):
+        actual = metal(graph, steps, drive, chunk_size=chunk, **options)
+        for name in STATE_FIELDS + ("spikes",):
+            assert_exact(getattr(actual, name), getattr(baseline, name))

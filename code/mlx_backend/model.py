@@ -200,7 +200,7 @@ def make_graph(
         raise ValueError("pre, post and contacts must have equal lengths")
     if (sources >= n_neurons).any() or (destinations >= n_neurons).any():
         raise ValueError("pre and post must contain neuron indices in [0, n_neurons)")
-    order = np.lexsort((np.arange(n_edges), sources, destinations))
+    order = np.lexsort((sources, destinations))
     return Graph(ids, _pointers(destinations, n_neurons), sources[order], counts[order])
 
 

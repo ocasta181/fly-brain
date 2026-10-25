@@ -24,6 +24,9 @@ from .vf64 import shader_header
 
 _I32_MAX = 2**31 - 1
 _EVENT_CAP = 262_144
+_QUEUE_BYTES = 128 * 1024**2
+_QUEUE_BLOCKS = 16
+_STATE_GROUP = 128
 
 
 @dataclass(frozen=True)
@@ -55,7 +58,8 @@ _MASK_SOURCE = """
         ulong tick = tick_begin[0] + ulong(k);
         if (tick >= DELAY) {
             uint row = uint((tick - DELAY) % DELAY);
-            if (history[(row * BATCH + trial) * N + i]) mask |= 1u << k;
+            if (history[((row >> 5u) * BATCH + trial) * N + i] & (1u << (row & 31u)))
+                mask |= 1u << k;
         }
     }
     source_masks[trial * N + i] = mask;
@@ -86,33 +90,29 @@ _STATE_SOURCE = """
     uint flags = 0u, spike_mask = 0u;
     ulong vi = v[j], gi = g[j], last = lastspike[j];
     long count = counts[j], required = 0;
-    bool eligible = not_refractory[j] != 0;
-    bool required_ready = false;
+    uint ready = refractory[j];
+    bool eligible = ready != 0;
     const uint first_edge = edge_ptr[i], last_edge = edge_ptr[i + 1];
     const uint arrivals = arrival_masks[j];
-    for (uint d = 0; d < DELAY; ++d) {
-        uint offset = (d * BATCH + trial) * N + i;
-        history_out[offset] = history[offset];
+    const bool idle = FAST_DEFAULT && !TRACE && vi == parameters[3] && gi == 0ul
+        && !arrivals && channel_ptr[i] == channel_ptr[i + 1];
+    if (!FAST_DEFAULT) {
+        const ulong duration = channel_ptr[i] == channel_ptr[i + 1]
+            ? parameters[10] : 0ul;
+        const ulong value = soft_mul64_status(
+            soft_add64_status(duration, parameters[8], rn, flags),
+            parameters[9], rn, flags);
+        required = as_type<long>(soft_f64_to_int_status(
+            value, soft_round_min_mag, false, true, 64, flags));
     }
-    for (uint k = 0; k < STEPS; ++k) {
+    for (uint k = idle ? STEPS - 1u : 0u; k < STEPS; ++k) {
         const ulong tick = tick_begin[0] + ulong(k);
         ulong t = 0ul;
-        bool clock_ready = false;
-        // The qualified default predicate stays true until a spike changes last.
-        if (!FAST_DEFAULT || !eligible) {
-            if (!required_ready) {
-                const ulong duration = channel_ptr[i] == channel_ptr[i + 1]
-                    ? parameters[10] : 0ul;
-                const ulong value = soft_mul64_status(
-                    soft_add64_status(duration, parameters[8], rn, flags),
-                    parameters[9], rn, flags);
-                required = as_type<long>(soft_f64_to_int_status(
-                    value, soft_round_min_mag, false, true, 64, flags));
-                required_ready = true;
-            }
+        if (FAST_DEFAULT) {
+            eligible = tick >= ulong(ready);
+        } else {
             t = soft_mul64_status(soft_uint_to_f64_status(
                 tick, false, rn, flags), parameters[7], rn, flags);
-            clock_ready = true;
             const ulong elapsed_value = soft_mul64_status(
                 soft_sub64_status(soft_add64_status(
                     t, parameters[8], rn, flags), last, rn, flags),
@@ -139,12 +139,29 @@ _STATE_SOURCE = """
         const bool spike = eligible && !resting && soft_less64_status(
             parameters[5], vi, false, false, flags);
         if (spike) {
-            if (!clock_ready) {
+            if (FAST_DEFAULT) {
                 t = soft_mul64_status(soft_uint_to_f64_status(
                     tick, false, rn, flags), parameters[7], rn, flags);
             }
             last = t;
             eligible = false;
+            if (FAST_DEFAULT) {
+                // Default state encodes an absolute ready tick; targeted rfc is zero.
+                ready = uint(tick) + 1u;
+                if (channel_ptr[i] == channel_ptr[i + 1]) {
+                    // Default recovery is at 22 or 23 ticks within the int32 horizon.
+                    ready = uint(tick) + 22u;
+                    const ulong recovery_t = soft_mul64_status(soft_uint_to_f64_status(
+                        ulong(ready), false, rn, flags), parameters[7], rn, flags);
+                    const ulong elapsed_value = soft_mul64_status(
+                        soft_sub64_status(soft_add64_status(
+                            recovery_t, parameters[8], rn, flags), last, rn, flags),
+                        parameters[9], rn, flags);
+                    const long elapsed = as_type<long>(soft_f64_to_int_status(
+                        elapsed_value, soft_round_min_mag, false, true, 64, flags));
+                    ready += uint(elapsed < 22);
+                }
+            }
         }
         if (eligible) {
             const uint tick_bit = 1u << k;
@@ -173,13 +190,26 @@ _STATE_SOURCE = """
             ++count;
             spike_mask |= 1u << k;
         }
-        history_out[(uint(tick % DELAY) * BATCH + trial) * N + i] = uchar(spike);
         // TRACE
+    }
+    for (uint word = 0; word < HISTORY_WORDS; ++word) {
+        const uint offset = (word * BATCH + trial) * N + i;
+        history_out[offset] = history[offset];
+    }
+    for (uint k = 0; k < STEPS;) {
+        const uint slot = uint((tick_begin[0] + k) % DELAY);
+        const uint shift = slot & 31u;
+        const uint length = min(STEPS - k, min(32u - shift, DELAY - slot));
+        const uint mask = (~0u >> (32u - length)) << shift;
+        const uint offset = ((slot >> 5u) * BATCH + trial) * N + i;
+        history_out[offset] = (history_out[offset] & ~mask)
+            | (((spike_mask >> k) << shift) & mask);
+        k += length;
     }
     v_out[j] = vi;
     g_out[j] = gi;
     lastspike_out[j] = last;
-    not_refractory_out[j] = uchar(eligible);
+    refractory_out[j] = FAST_DEFAULT ? ready : uint(eligible);
     counts_out[j] = count;
     spike_masks[j] = spike_mask;
 """
@@ -215,7 +245,7 @@ def _metal():
     return mx
 
 
-def _kernels(mx, trace: bool):
+def _kernels(mx, trace: bool, parameters: np.ndarray):
     mask = mx.fast.metal_kernel(
         name="eon_vf64_masks", input_names=["history", "tick_begin"],
         output_names=["source_masks"], source=_MASK_SOURCE,
@@ -226,7 +256,7 @@ def _kernels(mx, trace: bool):
         output_names=["edge_active", "arrival_masks"],
         source=_MARK_SOURCE, atomic_outputs=True,
     )
-    outputs = ["v_out", "g_out", "lastspike_out", "not_refractory_out",
+    outputs = ["v_out", "g_out", "lastspike_out", "refractory_out",
                "counts_out", "history_out", "spike_masks"]
     trace_source = ""
     if trace:
@@ -239,11 +269,14 @@ def _kernels(mx, trace: bool):
         """
     state = mx.fast.metal_kernel(
         name="eon_vf64_state",
-        input_names=["v", "g", "lastspike", "not_refractory", "counts", "history",
-                     "edge_ptr", "edge_pre", "weights", "channel_ptr", "channel_order", "parameters",
+        input_names=["v", "g", "lastspike", "refractory", "counts", "history",
+                     "edge_ptr", "edge_pre", "weights", "channel_ptr", "channel_order",
                      "source_masks", "edge_active", "arrival_masks", "tape", "tick_begin"],
-        output_names=outputs, source=_STATE_SOURCE.replace("// TRACE", trace_source),
-        header=shader_header(), compile_options={"math_mode": "safe"},
+        output_names=outputs,
+        source=_STATE_SOURCE.replace("// TRACE", trace_source).replace("parameters[", "eon_parameters["),
+        header=shader_header() + "\nconstant ulong eon_parameters[] = {"
+            + ",".join(f"0x{int(word):016x}ul" for word in parameters) + "};\n",
+        compile_options={"math_mode": "safe"},
     )
     record = mx.fast.metal_kernel(
         name="eon_vf64_events", input_names=["masks", "cap", "window"],
@@ -362,9 +395,9 @@ def _initial_state(batch: int, n: int, model: Model) -> list[np.ndarray]:
         np.full((batch, n), model.v_rest_v, dtype=np.float64).view(np.uint64),
         np.zeros((batch, n), dtype=np.uint64),
         np.full((batch, n), -1e4, dtype=np.float64).view(np.uint64),
-        np.ones((batch, n), dtype=np.uint8),
+        np.full((batch, n), 0 if model == Model() else 1, dtype=np.uint32),
         np.zeros((batch, n), dtype=np.int64),
-        np.zeros((model.delay_steps, batch, n), dtype=np.uint8),
+        np.zeros(((model.delay_steps + 31) // 32, batch, n), dtype=np.uint32),
     ]
 
 
@@ -373,11 +406,19 @@ def _snapshots(state) -> list[np.ndarray]:
 
 
 def _result(snapshots: list[np.ndarray], steps: int, events: np.ndarray,
-            timings: dict[str, float], traces: list[np.ndarray] | None) -> RunResult:
-    v, g, last, eligible, counts, ring = snapshots
+            timings: dict[str, float], traces: list[np.ndarray] | None,
+            model: Model) -> RunResult:
+    v, g, last, refractory, counts, packed = snapshots
+    eligible = refractory.astype(bool)
+    if model == Model():
+        eligible = refractory <= steps - 1 if steps else np.ones_like(refractory, dtype=bool)
+    ring = np.zeros((model.delay_steps, *counts.shape), dtype=np.uint8)
+    if steps and counts.size:
+        for slot in range(model.delay_steps):
+            ring[slot] = (packed[slot >> 5] >> np.uint32(slot & 31)) & np.uint32(1)
     return RunResult(
         v.view(np.float64), g.view(np.float64), last.view(np.float64),
-        eligible.astype(bool), ring, counts, steps, events, timings,
+        eligible, ring, counts, steps, events, timings,
         *(traces if traces is not None else (None, None, None)),
     )
 
@@ -464,7 +505,7 @@ def run_batch(
               for dtype in (np.float64, np.float64, np.bool_)] if trace else None
     if not n or not steps:
         timings["setup_compile_s"] = time.perf_counter() - setup_start
-        return _result(initial, steps, np.empty((0, 3), dtype=np.int64), timings, traces)
+        return _result(initial, steps, np.empty((0, 3), dtype=np.int64), timings, traces, model)
 
     rngs = [np.random.Generator(np.random.PCG64(
         np.random.SeedSequence([drive.seed, round_idx, trial]))) for trial in trial_ids]
@@ -472,21 +513,22 @@ def run_batch(
     stream = mx.new_stream(mx.gpu)
     state, static = [], []
     recorder = None
-    outputs = frames = following_frames = None
+    outputs = frames = None
     recorded = []
     disposable = warm_frames = warm_outputs = warm_events = None
     with mx.stream(stream):
         try:
-            mask_kernel, mark_kernel, state_kernel, record_kernel = _kernels(mx, bool(trace))
+            mask_kernel, mark_kernel, state_kernel, record_kernel = _kernels(mx, bool(trace), parameters)
             host_static = [graph.edge_ptr, graph.edge_pre, weights.view(np.uint64),
                            channel_ptr, channel_order, graph.out_ptr, graph.out_edge,
-                           graph.edge_post, parameters]
+                           graph.edge_post]
             static = [mx.array(value if value.size else np.zeros(1, dtype=value.dtype))
                       for value in host_static]
             (edge_ptr, edge_pre, edge_weights, cp, co,
-             out_ptr, out_edge, edge_post, params) = static
+             out_ptr, out_edge, edge_post) = static
             grid, group = (n, batch, 1), (min(n, 128), 1, 1)
             fast_default = model == Model()
+            history_words = (delay + 31) // 32
 
             def fresh():
                 return [mx.array(value) for value in initial]
@@ -505,18 +547,20 @@ def run_batch(
                     output_shapes=[(batch, words), (batch, n)],
                     output_dtypes=[mx.uint32] * 2, init_value=0, stream=stream,
                 )
-                shapes = [(batch, n)] * 5 + [(delay, batch, n), (batch, n)]
-                dtypes = [mx.uint64, mx.uint64, mx.uint64, mx.uint8,
-                          mx.int64, mx.uint8, mx.uint32]
+                shapes = [(batch, n)] * 5 + [(history_words, batch, n), (batch, n)]
+                dtypes = [mx.uint64, mx.uint64, mx.uint64, mx.uint32,
+                          mx.int64, mx.uint32, mx.uint32]
                 if trace:
                     shapes += [(length, batch, n)] * 3
                     dtypes += [mx.uint64, mx.uint64, mx.uint8]
                 return state_kernel(
-                    inputs=[*current, edge_ptr, edge_pre, edge_weights, cp, co, params,
+                    inputs=[*current, edge_ptr, edge_pre, edge_weights, cp, co,
                             masks, *marked, block, begin],
                     template=template + [("WORDS", words), ("CHANNELS", max(1, channels)),
+                                         ("HISTORY_WORDS", history_words),
+                                         ("TRACE", bool(trace)),
                                          ("FAST_DEFAULT", fast_default)],
-                    grid=grid, threadgroup=group, output_shapes=shapes,
+                    grid=grid, threadgroup=(min(n, _STATE_GROUP), 1, 1), output_shapes=shapes,
                     output_dtypes=dtypes, stream=stream,
                 )
 
@@ -552,27 +596,28 @@ def run_batch(
             timings["compile_warmup_s"] = time.perf_counter() - warmup_start
             state = fresh()
             recorder = _Recorder(mx, record_kernel, stream, n, batch, limit, spike_sink) if record else None
+            block_bytes = (batch * n * (48 + 4 * history_words) + batch * words * 4
+                           + block_length * batch * max(1, channels)
+                           + (recorder.cap * 12 + 4 if recorder else 0))
+            queue_depth = 1 if trace else min(_QUEUE_BLOCKS, max(1, _QUEUE_BYTES // block_bytes))
             mx.eval(*state, *static)
             mx.synchronize(stream)
             timings["setup_compile_s"] = time.perf_counter() - setup_start
 
             runtime_start = time.perf_counter()
-            started = time.perf_counter()
-            frames = stage(0)
-            timings["input_generation_staging_s"] += time.perf_counter() - started
-            for tick in range(0, steps, span):
+            for block_index, tick in enumerate(range(0, steps, span), 1):
                 length = min(span, steps - tick)
+                started = time.perf_counter()
+                frames = stage(tick)
+                timings["input_generation_staging_s"] += time.perf_counter() - started
                 started = time.perf_counter()
                 outputs = dispatch(state, tick, length, frames)
                 state = outputs[:6]
                 recorded = recorder.submit(outputs[6], tick, length) if recorder else []
                 mx.async_eval(*outputs, *recorded)
                 timings["simulation_s"] += time.perf_counter() - started
-                following_frames = None
-                if tick + length < steps:
-                    started = time.perf_counter()
-                    following_frames = stage(tick + length)
-                    timings["input_generation_staging_s"] += time.perf_counter() - started
+                if block_index % queue_depth and tick + length < steps:
+                    continue
                 started = time.perf_counter()
                 mx.synchronize(stream)
                 timings["simulation_s"] += time.perf_counter() - started
@@ -587,13 +632,12 @@ def run_batch(
                 extraction = recorder.simulation_s - previous_extraction if recorder else 0.0
                 timings["simulation_s"] += extraction
                 timings["collection_s"] += time.perf_counter() - started - extraction
-                frames = following_frames
             started = time.perf_counter()
             events = recorder.finish() if recorder else np.empty((0, 3), dtype=np.int64)
             timings["collection_s"] += time.perf_counter() - started
             started = time.perf_counter()
             snapshots = _snapshots(state)
-            result = _result(snapshots, steps, events, timings, traces)
+            result = _result(snapshots, steps, events, timings, traces, model)
             timings["snapshots_s"] = time.perf_counter() - started
             timings["runtime_s"] = time.perf_counter() - runtime_start
             return result
@@ -612,7 +656,7 @@ def run_batch(
                     recorder.close()
                 state.clear()
                 static.clear()
-                outputs = frames = following_frames = None
+                outputs = frames = None
                 recorded = []
                 edge_ptr = edge_pre = edge_weights = cp = co = None
-                out_ptr = out_edge = edge_post = params = None
+                out_ptr = out_edge = edge_post = None
