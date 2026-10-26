@@ -416,8 +416,7 @@ Legacy version 630 data is kept in `data/archive/` for paper figure reproduction
 
 `--mlx` runs the fixed FlyWire v783 Eon LIF model on Apple silicon using
 float64 arithmetic from [VF64-metal](https://github.com/Lulzx/VF64-metal)
-inside native MLX Metal kernels. Physical state retains IEEE binary64 bits;
-there is no CPU simulation fallback.
+inside native MLX Metal kernels.
 
 On Apple silicon macOS, install the Python dependencies with uv, then install
 the pinned external VF64 shader source explicitly:
@@ -434,33 +433,17 @@ that source without network access. `VF64_SOURCE_DIR` can point to an existing
 checkout at commit `8dae385a16493282e2a3e90e4cd1aa1250b36dc5`.
 
 The backend supports independent batched trials, activation, outgoing silencing,
-duplicate ordered input channels, configurable fixed LIF parameters, and bounded
-input generation and spike export. CSV results, round manifests and six-column
-Parquet spikes use the common benchmark schemas. Use a fresh run label, and
-`--disable-spike-io` to omit spike recording and export.
-
-This fixed-model implementation replaces the earlier general Brian adapter.
-It does not expose arbitrary equations, Brian object lifecycle or schedules,
-complex/integer state, NumPy error policies, or the original Brian RNG stream.
-PCG64 inputs are reproducible by seed, round and trial. Exact CPU comparisons
-use identical input tapes and the documented Brian2 2.8.0 C++ arithmetic policy;
-independently generated CPU and GPU inputs are different streams.
-
-The numerical reference is Brian C++ standalone on Apple arm64 with Clang 21,
-`-O3 -ffast-math -fno-finite-math-only -march=native`. The kernels preserve
-its FMA rounding, ordered per-edge additions, and binary64 refractory decisions.
-
-Install `requirements-mlx-test.txt` to run the focused regression suite with
-`python -m pytest`. Metal tests require an Apple silicon GPU. Shared-input tests
-compare raw float64 state and complete ordered spikes with actual Brian C++
-execution. Benchmark setup and compilation are reported separately from warm
-execution, input generation, recording and completed output.
+and the common CSV, manifest and Parquet schemas. Use `--disable-spike-io` to omit
+spike recording and export. PCG64 inputs are reproducible by seed, round and trial;
+they differ from Brian's random stream. Exact CPU comparisons use identical input
+tapes against Brian2 2.8.0 C++ standalone on Apple arm64 with Clang 21 and
+`-O3 -ffast-math -fno-finite-math-only -march=native`.
 
 Measured warm CPU speedups range from **5.36× to 12.74×** for full-v783 Sugar/P9
-with one or four trials on an M5 Max using AC power. The optimized implementation
-is **2.55× to 3.13×** faster than the preceding VF64 implementation.
-See the [measurement and verification report](docs/mlx-performance.md) for timings,
-confidence bounds, setup costs and exactness scope.
+with one or four trials on an M5 Max using AC power, excluding setup and compilation.
+
+Install `requirements-mlx-test.txt` and run `python -m pytest` for the CPU/Metal
+regression checks. Native tests require an Apple silicon GPU.
 
 VF64 and the adapted Kisame runtime mechanics retain their
 [third-party notices](code/mlx_backend/third_party/NOTICE).
