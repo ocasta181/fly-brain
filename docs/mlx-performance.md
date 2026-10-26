@@ -62,6 +62,33 @@ binary cache. Native uses production MLX/VF64 kernels and PCG64 inputs.
 CPU Brian and native PCG64 streams differ. Numerical qualification uses separate
 identical-input controls; these independently generated CPU/native runs do not.
 
+## Comparison with float32
+
+Following the float32 implementation, external VF64 arithmetic enabled a compact
+float64 backend with similar throughput and exact CPU-reference agreement.
+
+| Case | Float64 / CPU throughput | Float64 / float32 throughput, indicative |
+|---|---:|---:|
+| Sugar, B1 | 8.72× | 1.02× |
+| P9, B1 | 12.74× | 1.14× |
+| Sugar, B4 | 5.57× | 1.14× |
+| P9, B4 | 5.36× | 1.17× |
+
+Higher ratios mean faster float64 execution. CPU ratios and confidence bounds
+are reused unchanged from the controlled campaign above. Float32 ratios divide
+its saved median warm times by float64's saved means from separate M5 Max/AC
+campaigns. These are descriptive comparisons; no paired float32/float64
+confidence interval establishes a significant speed advantage.
+
+![Relative float64 throughput against CPU and float32](mlx-relative-performance.png)
+
+The [float32 implementation and qualification](https://github.com/ocasta181/fly-brain/blob/b2661b43b519f11ecd475f4468b0226a298f25d5/README.md#apple-silicon-float32-mlx)
+bind to tested runtime `762780b8bc83b75999e19466bf649f62fdd6e08b`.
+Float32 qualification covers selected scientific readouts. Float64 qualification
+covers CPU state bits and ordered spikes in the documented identical-input checks.
+This presentation reuses recorded results without rerunning simulations or
+recalculating either campaign's accepted statistics.
+
 ## Individual observations
 
 | Case | Round | Order | CPU s | Previous MLX s | Optimized MLX s |
