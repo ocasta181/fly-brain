@@ -53,7 +53,27 @@ _MARK_SOURCE = """
     uint i = thread_position_in_grid.x;
     uint lane = thread_position_in_grid.y;
     uint trial = thread_position_in_grid.z;
-    if (i >= N || trial >= BATCH) return;
+    if (trial >= BATCH) return;
+    bool valid = i < N;
+    if (COMPACT && lane == 0u) {
+        bool active = valid && (v[trial * N + i] != RAWREST || g[trial * N + i] != 0ul
+            || channel_ptr[i] != channel_ptr[i + 1]);
+        uint a = uint(active), b = uint(valid && !active);
+        uint na = simd_sum(a), nb = simd_sum(b);
+        uint pa = simd_prefix_exclusive_sum(a), pb = simd_prefix_exclusive_sum(b);
+        uint front = 0u, back = 0u;
+        if ((i & 31u) == 0u) {
+            front = atomic_fetch_add_explicit(&cursor[trial * 2], na, memory_order_relaxed);
+            back = atomic_fetch_add_explicit(&cursor[trial * 2 + 1], nb, memory_order_relaxed);
+        }
+        front = simd_broadcast_first(front);
+        back = simd_broadcast_first(back);
+        if (valid) {
+            uint slot = active ? front + pa : N - 1u - back - pb;
+            atomic_store_explicit(&work_order[trial * N + slot], i, memory_order_relaxed);
+        }
+    }
+    if (!valid) return;
     const ulong begin = tick_begin[0];
     uint mask = 0u;
     uint k = begin < DELAY ? uint(min(ulong(STEPS), ulong(DELAY) - begin)) : 0u;
@@ -74,29 +94,6 @@ _MARK_SOURCE = """
                                  1u << (e & 31u), memory_order_relaxed);
         atomic_fetch_or_explicit(&arrival_masks[trial * N + edge_post[e]],
                                  mask, memory_order_relaxed);
-    }
-"""
-
-_ORDER_SOURCE = """
-    uint i = thread_position_in_grid.x;
-    uint trial = thread_position_in_grid.y;
-    bool valid = i < N;
-    bool active = valid && (v[trial * N + i] != RAWREST || g[trial * N + i] != 0ul
-        || arrival_masks[trial * N + i] != 0u || channel_ptr[i] != channel_ptr[i + 1]);
-    uint a = uint(active), b = uint(valid && !active);
-    uint na = simd_sum(a), nb = simd_sum(b);
-    uint pa = simd_prefix_exclusive_sum(a), pb = simd_prefix_exclusive_sum(b);
-    uint front = 0u, back = 0u;
-    if ((i & 31u) == 0u) {
-        front = atomic_fetch_add_explicit(&cursor[trial * 2], na, memory_order_relaxed);
-        back = atomic_fetch_add_explicit(&cursor[trial * 2 + 1], nb, memory_order_relaxed);
-    }
-    front = simd_broadcast_first(front);
-    back = simd_broadcast_first(back);
-    // The two partitions contain N distinct neurons, including every idle update.
-    if (valid) {
-        uint slot = active ? front + pa : N - 1u - back - pb;
-        atomic_store_explicit(&work_order[trial * N + slot], i, memory_order_relaxed);
     }
 """
 
@@ -268,13 +265,10 @@ def _metal():
 def _kernels(mx, trace: bool, parameters: np.ndarray):
     mark = mx.fast.metal_kernel(
         name="eon_vf64_mark",
-        input_names=["history", "tick_begin", "out_ptr", "out_edge", "edge_post"],
-        output_names=["source_masks", "edge_active", "arrival_masks"],
-        source=_MARK_SOURCE, atomic_outputs=True,
-    )
-    order = mx.fast.metal_kernel(
-        name="eon_vf64_order", input_names=["v", "g", "arrival_masks", "channel_ptr"],
-        output_names=["work_order", "cursor"], source=_ORDER_SOURCE,
+        input_names=["v", "g", "history", "tick_begin", "channel_ptr",
+                     "out_ptr", "out_edge", "edge_post"],
+        output_names=["source_masks", "edge_active", "arrival_masks", "work_order", "cursor"],
+        source=_MARK_SOURCE,
         header=f"constant ulong RAWREST = 0x{int(parameters[3]):016x}ul;\n",
         atomic_outputs=True,
     )
@@ -305,7 +299,7 @@ def _kernels(mx, trace: bool, parameters: np.ndarray):
         name="eon_vf64_events", input_names=["masks", "cap", "window"],
         output_names=["events", "count"], source=_RECORD_SOURCE, atomic_outputs=True,
     )
-    return mark, order, state, record
+    return mark, state, record
 
 
 class _Recorder:
@@ -536,13 +530,12 @@ def run_batch(
     stream = mx.new_stream(mx.gpu)
     state, static = [], []
     recorder = None
-    outputs = frames = dummy_work_order = None
+    outputs = frames = None
     recorded = []
     disposable = warm_frames = warm_outputs = warm_events = None
     with mx.stream(stream):
         try:
-            (mark_kernel, order_kernel,
-             state_kernel, record_kernel) = _kernels(mx, bool(trace), parameters)
+            mark_kernel, state_kernel, record_kernel = _kernels(mx, bool(trace), parameters)
             host_static = [graph.edge_ptr, graph.edge_pre, weights.view(np.uint64),
                            channel_ptr, channel_order, graph.out_ptr, graph.out_edge,
                            graph.edge_post]
@@ -550,10 +543,9 @@ def run_batch(
                       for value in host_static]
             (edge_ptr, edge_pre, edge_weights, cp, co,
              out_ptr, out_edge, edge_post) = static
-            grid, group = (n, batch, 1), (min(n, 128), 1, 1)
+            grid = (n, batch, 1)
             fast_default = model == Model()
             compact = fast_default and not trace
-            dummy_work_order = mx.zeros((1,), dtype=mx.uint32) if not compact else None
             history_words = (delay + 31) // 32
 
             def fresh():
@@ -562,22 +554,15 @@ def run_batch(
             def dispatch(current, tick: int, length: int, block):
                 begin = mx.array([tick], dtype=mx.uint64)
                 template = [("N", n), ("BATCH", batch), ("STEPS", length), ("DELAY", delay)]
-                masks, *marked = mark_kernel(
-                    inputs=[current[5], begin, out_ptr, out_edge, edge_post],
-                    template=template + [("WORDS", words)],
-                    grid=(n, 8, batch), threadgroup=group,
-                    output_shapes=[(batch, n), (batch, words), (batch, n)],
-                    output_dtypes=[mx.uint32] * 3, init_value=0, stream=stream,
+                masks, active, arrivals, work_order, _ = mark_kernel(
+                    inputs=[current[0], current[1], current[5], begin, cp,
+                            out_ptr, out_edge, edge_post],
+                    template=template + [("WORDS", words), ("COMPACT", compact)],
+                    grid=(((n + 127) // 128) * 128, 8, batch), threadgroup=(128, 1, 1),
+                    output_shapes=[(batch, n), (batch, words), (batch, n),
+                                   (batch, n) if compact else (1,), (batch, 2)],
+                    output_dtypes=[mx.uint32] * 5, init_value=0, stream=stream,
                 )
-                work_order = dummy_work_order
-                if compact:
-                    work_order = order_kernel(
-                        inputs=[current[0], current[1], marked[1], cp],
-                        template=[("N", n)], output_shapes=[(batch, n), (batch, 2)],
-                        output_dtypes=[mx.uint32] * 2, init_value=0,
-                        grid=(((n + 127) // 128) * 128, batch, 1), threadgroup=(128, 1, 1),
-                        stream=stream,
-                    )[0]
                 shapes = [(batch, n)] * 5 + [(history_words, batch, n), (batch, n)]
                 dtypes = [mx.uint64, mx.uint64, mx.uint64, mx.uint32,
                           mx.int64, mx.uint32, mx.uint32]
@@ -586,7 +571,7 @@ def run_batch(
                     dtypes += [mx.uint64, mx.uint64, mx.uint8]
                 return state_kernel(
                     inputs=[*current, edge_ptr, edge_pre, edge_weights, cp, co,
-                            masks, *marked, work_order, block, begin],
+                            masks, active, arrivals, work_order, block, begin],
                     template=template + [("WORDS", words), ("CHANNELS", max(1, channels)),
                                          ("HISTORY_WORDS", history_words),
                                          ("TRACE", bool(trace)),
@@ -687,7 +672,7 @@ def run_batch(
                     recorder.close()
                 state.clear()
                 static.clear()
-                outputs = frames = dummy_work_order = None
+                outputs = frames = None
                 recorded = []
                 edge_ptr = edge_pre = edge_weights = cp = co = None
                 out_ptr = out_edge = edge_post = None
