@@ -49,28 +49,24 @@ class RecordOverflow(OverflowError):
     """The complete event result exceeds the requested host collection limit."""
 
 
-_MASK_SOURCE = """
-    uint i = thread_position_in_grid.x;
-    uint trial = thread_position_in_grid.y;
-    if (i >= N || trial >= BATCH) return;
-    uint mask = 0u;
-    for (uint k = 0; k < STEPS; ++k) {
-        ulong tick = tick_begin[0] + ulong(k);
-        if (tick >= DELAY) {
-            uint row = uint((tick - DELAY) % DELAY);
-            if (history[((row >> 5u) * BATCH + trial) * N + i] & (1u << (row & 31u)))
-                mask |= 1u << k;
-        }
-    }
-    source_masks[trial * N + i] = mask;
-"""
-
 _MARK_SOURCE = """
     uint i = thread_position_in_grid.x;
     uint lane = thread_position_in_grid.y;
     uint trial = thread_position_in_grid.z;
     if (i >= N || trial >= BATCH) return;
-    uint mask = source_masks[trial * N + i];
+    const ulong begin = tick_begin[0];
+    uint mask = 0u;
+    uint k = begin < DELAY ? uint(min(ulong(STEPS), ulong(DELAY) - begin)) : 0u;
+    while (k < STEPS) {
+        const uint row = uint((begin + ulong(k)) % DELAY);
+        const uint shift = row & 31u;
+        const uint length = min(STEPS - k, min(32u - shift, DELAY - row));
+        const uint bits = history[((row >> 5u) * BATCH + trial) * N + i] >> shift;
+        mask |= (bits & (~0u >> (32u - length))) << k;
+        k += length;
+    }
+    if (lane == 0u)
+        atomic_store_explicit(&source_masks[trial * N + i], mask, memory_order_relaxed);
     if (!mask) return;
     for (uint p = out_ptr[i] + lane; p < out_ptr[i + 1]; p += 8u) {
         uint e = out_edge[p];
@@ -129,7 +125,7 @@ _STATE_SOURCE = """
         required = as_type<long>(soft_f64_to_int_status(
             value, soft_round_min_mag, false, true, 64, flags));
     }
-    for (uint k = idle ? STEPS - 1u : 0u; k < STEPS; ++k) {
+    for (uint k = idle ? STEPS : 0u; k < STEPS; ++k) {
         const ulong tick = tick_begin[0] + ulong(k);
         ulong t = 0ul;
         if (FAST_DEFAULT) {
@@ -270,14 +266,10 @@ def _metal():
 
 
 def _kernels(mx, trace: bool, parameters: np.ndarray):
-    mask = mx.fast.metal_kernel(
-        name="eon_vf64_masks", input_names=["history", "tick_begin"],
-        output_names=["source_masks"], source=_MASK_SOURCE,
-    )
     mark = mx.fast.metal_kernel(
         name="eon_vf64_mark",
-        input_names=["source_masks", "out_ptr", "out_edge", "edge_post"],
-        output_names=["edge_active", "arrival_masks"],
+        input_names=["history", "tick_begin", "out_ptr", "out_edge", "edge_post"],
+        output_names=["source_masks", "edge_active", "arrival_masks"],
         source=_MARK_SOURCE, atomic_outputs=True,
     )
     order = mx.fast.metal_kernel(
@@ -313,7 +305,7 @@ def _kernels(mx, trace: bool, parameters: np.ndarray):
         name="eon_vf64_events", input_names=["masks", "cap", "window"],
         output_names=["events", "count"], source=_RECORD_SOURCE, atomic_outputs=True,
     )
-    return mask, mark, order, state, record
+    return mark, order, state, record
 
 
 class _Recorder:
@@ -549,7 +541,7 @@ def run_batch(
     disposable = warm_frames = warm_outputs = warm_events = None
     with mx.stream(stream):
         try:
-            (mask_kernel, mark_kernel, order_kernel,
+            (mark_kernel, order_kernel,
              state_kernel, record_kernel) = _kernels(mx, bool(trace), parameters)
             host_static = [graph.edge_ptr, graph.edge_pre, weights.view(np.uint64),
                            channel_ptr, channel_order, graph.out_ptr, graph.out_edge,
@@ -570,16 +562,12 @@ def run_batch(
             def dispatch(current, tick: int, length: int, block):
                 begin = mx.array([tick], dtype=mx.uint64)
                 template = [("N", n), ("BATCH", batch), ("STEPS", length), ("DELAY", delay)]
-                masks = mask_kernel(
-                    inputs=[current[5], begin], template=template, grid=grid, threadgroup=group,
-                    output_shapes=[(batch, n)], output_dtypes=[mx.uint32], stream=stream,
-                )[0]
-                marked = mark_kernel(
-                    inputs=[masks, out_ptr, out_edge, edge_post],
-                    template=[("N", n), ("BATCH", batch), ("WORDS", words)],
+                masks, *marked = mark_kernel(
+                    inputs=[current[5], begin, out_ptr, out_edge, edge_post],
+                    template=template + [("WORDS", words)],
                     grid=(n, 8, batch), threadgroup=group,
-                    output_shapes=[(batch, words), (batch, n)],
-                    output_dtypes=[mx.uint32] * 2, init_value=0, stream=stream,
+                    output_shapes=[(batch, n), (batch, words), (batch, n)],
+                    output_dtypes=[mx.uint32] * 3, init_value=0, stream=stream,
                 )
                 work_order = dummy_work_order
                 if compact:
