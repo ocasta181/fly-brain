@@ -209,19 +209,24 @@ _STATE_SOURCE = """
         }
         // TRACE
     }
-    for (uint word = 0; word < HISTORY_WORDS; ++word) {
-        const uint offset = (word * BATCH + trial) * N + i;
-        history_out[offset] = history[offset];
-    }
-    for (uint k = 0; k < STEPS;) {
-        const uint slot = uint((tick_begin[0] + k) % DELAY);
-        const uint shift = slot & 31u;
-        const uint length = min(STEPS - k, min(32u - shift, DELAY - slot));
-        const uint mask = (~0u >> (32u - length)) << shift;
-        const uint offset = ((slot >> 5u) * BATCH + trial) * N + i;
-        history_out[offset] = (history_out[offset] & ~mask)
-            | (((spike_mask >> k) << shift) & mask);
-        k += length;
+    if (STEPS == DELAY && DELAY <= 32) {
+        // Full-delay blocks start at slot zero; unused high bits remain zero.
+        history_out[j] = spike_mask;
+    } else {
+        for (uint word = 0; word < HISTORY_WORDS; ++word) {
+            const uint offset = (word * BATCH + trial) * N + i;
+            history_out[offset] = history[offset];
+        }
+        for (uint k = 0; k < STEPS;) {
+            const uint slot = uint((tick_begin[0] + k) % DELAY);
+            const uint shift = slot & 31u;
+            const uint length = min(STEPS - k, min(32u - shift, DELAY - slot));
+            const uint mask = (~0u >> (32u - length)) << shift;
+            const uint offset = ((slot >> 5u) * BATCH + trial) * N + i;
+            history_out[offset] = (history_out[offset] & ~mask)
+                | (((spike_mask >> k) << shift) & mask);
+            k += length;
+        }
     }
     v_out[j] = vi;
     g_out[j] = gi;
