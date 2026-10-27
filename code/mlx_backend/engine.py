@@ -88,7 +88,7 @@ _MARK_SOURCE = """
     if (lane == 0u)
         atomic_store_explicit(&source_masks[trial * N + i], mask, memory_order_relaxed);
     if (!mask) return;
-    for (uint p = out_ptr[i] + lane; p < out_ptr[i + 1]; p += 8u) {
+    for (uint p = out_ptr[i] + lane; p < out_ptr[i + 1]; p += LANES) {
         uint e = out_edge[p];
         atomic_fetch_or_explicit(&edge_active[trial * WORDS + (e >> 5u)],
                                  1u << (e & 31u), memory_order_relaxed);
@@ -546,6 +546,7 @@ def run_batch(
             grid = (n, batch, 1)
             fast_default = model == Model()
             compact = fast_default and not trace
+            lanes = 8 if batch == 1 else 4
             history_words = (delay + 31) // 32
 
             def fresh():
@@ -557,8 +558,8 @@ def run_batch(
                 masks, active, arrivals, work_order, _ = mark_kernel(
                     inputs=[current[0], current[1], current[5], begin, cp,
                             out_ptr, out_edge, edge_post],
-                    template=template + [("WORDS", words), ("COMPACT", compact)],
-                    grid=(((n + 127) // 128) * 128, 8, batch), threadgroup=(128, 1, 1),
+                    template=template + [("WORDS", words), ("COMPACT", compact), ("LANES", lanes)],
+                    grid=(((n + 127) // 128) * 128, lanes, batch), threadgroup=(128, 1, 1),
                     output_shapes=[(batch, n), (batch, words), (batch, n),
                                    (batch, n) if compact else (1,), (batch, 2)],
                     output_dtypes=[mx.uint32] * 5, init_value=0, stream=stream,
