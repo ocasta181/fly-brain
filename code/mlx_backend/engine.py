@@ -23,7 +23,7 @@ from .model import Drive, Graph, Model, integer
 from .vf64 import shader_header
 
 _I32_MAX = 2**31 - 1
-_EVENT_CAP = 262_144
+_EVENT_CAP = 16_384
 _QUEUE_BYTES = 128 * 1024**2
 _QUEUE_BLOCKS = 16
 _STATE_GROUP = 128
