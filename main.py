@@ -1,17 +1,18 @@
 """
-Drosophila brain model benchmark runner.
+FlyBrain Metal64 simulation and benchmark runner.
 
 Usage:
-    # Core backends in the main brain-fly environment
+    # One 0.1-second trial on Apple silicon with MLX float64
     python main.py
 
     # P9 forward-walking experiment instead
     python main.py --experiment p9
 
-    # Specific durations and trial count
+    # Specific durations and trial count on MLX
     python main.py --t_run 0.1 1 10 --n_run 1
 
     # Specific backends (combinable)
+    python main.py --mlx                                  # MLX on Apple Metal
     python main.py --brian2-cpu                          # Brian2 CPU only
     python main.py --brian2cuda-gpu                      # Brian2CUDA GPU only
     python main.py --pytorch                             # PyTorch only
@@ -23,7 +24,7 @@ Usage:
     # Brian2GeNN uses a separate environment because it pins Brian2<2.6
     python main.py --brian2genn --paper --run-label nature_2026_05
 
-    # Nature-paper suite: 5 rounds, March parameter grid (0.1s,1s,10s,100s)
+    # Opt in to the full paper grid: 5 rounds of durations and trial counts
     python main.py --paper --run-label nature_2026_05
 
     # Background with log
@@ -38,6 +39,7 @@ warnings.filterwarnings('ignore', category=UserWarning)
 
 import sys
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / 'code'))
@@ -45,7 +47,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent / 'code'))
 from benchmark import (
     BenchmarkLogger, T_RUN_VALUES_SEC, PAPER_T_RUN_VALUES_SEC,
     N_RUN_VALUES, PAPER_ROUNDS, BACKEND_NAMES, EXPERIMENTS,
-    SPIKE_IO_ENV_VAR, get_experiment, run_benchmarks, spike_io_enabled,
+    SPIKE_IO_ENV_VAR, get_experiment, get_spike_output_dir, run_benchmarks,
+    spike_io_enabled,
 )
 
 
@@ -61,12 +64,18 @@ BACKEND_OPTIONS = (
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Drosophila brain model benchmark')
+    parser = argparse.ArgumentParser(
+        description='FlyBrain Metal64: run the Drosophila brain model. '
+                    'Default: one 0.1-second trial on Apple Metal with MLX.'
+    )
     parser.add_argument('--t_run', type=float, nargs='+', default=None,
                         help='Simulation duration(s) in seconds. '
-                             f'Allowed: {T_RUN_VALUES_SEC}. Default: all')
+                             f'Allowed: {T_RUN_VALUES_SEC}. Default: 0.1 for '
+                             'MLX-only runs; all for other backends; '
+                             f'{PAPER_T_RUN_VALUES_SEC} with --paper')
     parser.add_argument('--n_run', type=int, nargs='+', default=None,
-                        help=f'Number of trials. Default: {N_RUN_VALUES}')
+                        help='Number of trials. Default: 1 for MLX-only runs; '
+                             f'{N_RUN_VALUES} for other backends or --paper')
     parser.add_argument('--rounds', type=int, default=None,
                         help='Repeat the full backend/parameter suite N times. '
                              'Default: 1, or 5 with --paper')
@@ -105,13 +114,10 @@ def main():
     if args.disable_spike_io:
         os.environ[SPIKE_IO_ENV_VAR] = '1'
 
-    # If no backend flags specified, run the backends available in the main
-    # brain-fly environment. Brian2GeNN is explicit because it requires a
-    # separate Brian2<2.6 environment that conflicts with Brian2CUDA.
     backends = [key for flag, key, _ in BACKEND_OPTIONS
                 if getattr(args, flag.replace('-', '_'))]
     if not backends:
-        backends = ['cpu', 'gpu', 'pytorch', 'nestgpu', 'genn']
+        backends = ['mlx']
 
     # Import brian2cuda once to register the cuda_standalone device
     if 'gpu' in backends:
@@ -135,6 +141,11 @@ def main():
             t_run_values = PAPER_T_RUN_VALUES_SEC
         if n_run_values is None:
             n_run_values = N_RUN_VALUES
+    elif backends == ['mlx']:
+        if t_run_values is None:
+            t_run_values = [0.1]
+        if n_run_values is None:
+            n_run_values = [1]
 
     if t_run_values:
         for val in t_run_values:
@@ -146,6 +157,9 @@ def main():
                 return
 
     experiment = get_experiment(args.experiment)
+
+    if backends == ['mlx'] and not args.run_label:
+        args.run_label = datetime.now().strftime('mlx_%Y%m%d_%H%M%S_%f')
 
     log_file = None if args.no_log_file else args.log_file
     logger = BenchmarkLogger(log_file=log_file)
@@ -167,6 +181,8 @@ def main():
             "spike probing/output: "
             f"{'enabled' if spike_io_enabled() else 'disabled'}"
         )
+        if spike_io_enabled():
+            logger.log(f"Spike output directory: {get_spike_output_dir(args.run_label)}")
         logger.log(f"Log file: {log_file if log_file else 'disabled'}")
 
         run_benchmarks(
