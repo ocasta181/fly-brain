@@ -18,8 +18,8 @@ running its fixed LIF model on Apple silicon.
 Use macOS on Apple silicon with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-git clone --branch ocasta181/metal64 https://github.com/ocasta181/fly-brain.git
-cd fly-brain
+git clone https://github.com/ocasta181/fly-brain.git fly-brain-metal64
+cd fly-brain-metal64
 uv venv --python 3.10.14
 uv pip install -r requirements-mlx.txt
 uv run --no-project python code/mlx_backend/vf64.py --install
