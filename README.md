@@ -18,7 +18,7 @@ running its fixed LIF model on Apple silicon.
 Use macOS on Apple silicon with [uv](https://docs.astral.sh/uv/):
 
 ```sh
-git clone https://github.com/ocasta181/fly-brain.git fly-brain-metal64
+git clone https://github.com/ocasta181/fly-brain-metal64.git
 cd fly-brain-metal64
 uv venv --python 3.10.14
 uv pip install -r requirements-mlx.txt
@@ -77,12 +77,12 @@ the [Rust F32 implementation](https://github.com/mehrantsi/flyBrain)**. These
 are paired geometric means from 20 rounds per comparison across Sugar and P9
 stimulation with one or four trials. Setup and compilation are excluded.
 
-![Warm full-v783 speedups on an AC-powered M5 Max, across Sugar and P9 with one or four trials](https://raw.githubusercontent.com/ocasta181/fly-brain/5071c55a217348cdbaa5f2e637b23c507e1783bc/mlx-throughput-pr11-20261027.png)
+![Warm full-v783 speedups on an AC-powered M5 Max, across Sugar and P9 with one or four trials](https://raw.githubusercontent.com/ocasta181/fly-brain-metal64/5071c55a217348cdbaa5f2e637b23c507e1783bc/mlx-throughput-pr11-20261027.png)
 
-The [summary CSV](https://raw.githubusercontent.com/ocasta181/fly-brain/5071c55a217348cdbaa5f2e637b23c507e1783bc/mlx-throughput-pr11-20261027.csv)
+The [summary CSV](https://raw.githubusercontent.com/ocasta181/fly-brain-metal64/5071c55a217348cdbaa5f2e637b23c507e1783bc/mlx-throughput-pr11-20261027.csv)
 contains the means and simultaneous 95% confidence intervals. All eight lower
 bounds exceed 1×. Measurements use runtime source commit
-[`c36e7f6`](https://github.com/ocasta181/fly-brain/commit/c36e7f6f698a44d4a54d179c2dfd5bd28f3ce48d).
+[`c36e7f6`](https://github.com/ocasta181/fly-brain-metal64/commit/c36e7f6f698a44d4a54d179c2dfd5bd28f3ce48d).
 
 Both sides of the CPU comparison time spike recording and Brotli Parquet
 export through file close. Its one-trial baseline is the original Brian2 C++
